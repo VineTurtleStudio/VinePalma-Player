@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VinePalma 迷你播放器</title>
+    <link rel="stylesheet" href="mini.css" />
+</head>
+<body>
+<div class="mini-card" id="mini-card" data-tauri-drag-region="deep">
+
+    <!-- 封面（最左侧，网易云风格） -->
+    <div class="mini-cover" id="mini-cover">
+        <img id="mini-cover-img" src="" alt="" />
+        <span id="mini-cover-ph" class="mini-cover-ph">🎵</span>
+    </div>
+
+    <!-- 标题 / 进度 -->
+    <div class="mini-body">
+        <div class="mini-titles">
+            <div class="mini-title" id="mini-title">VinePalma</div>
+            <div class="mini-artist" id="mini-artist">未播放</div>
+        </div>
+        <div class="mini-progress">
+            <span class="mini-time" id="mini-current">0:00</span>
+            <input type="range" id="mini-progress" class="mini-slider" min="0" max="1000" value="0" />
+            <span class="mini-time" id="mini-total">0:00</span>
+        </div>
+    </div>
+
+    <!-- 控制按钮 -->
+    <div class="mini-controls">
+        <button id="mini-prev" class="mini-btn" title="上一首">⏮</button>
+        <button id="mini-toggle" class="mini-btn mini-primary" title="播放/暂停">▶</button>
+        <button id="mini-next" class="mini-btn" title="下一首">⏭</button>
+        <button id="mini-close" class="mini-btn mini-close" title="返回主窗口">✕</button>
+    </div>
+
+</div>
+<script src="mini.js"></script>
+</body>
+</html>

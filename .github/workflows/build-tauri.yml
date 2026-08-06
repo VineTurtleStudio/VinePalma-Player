@@ -1,0 +1,143 @@
+name: Build VinePalma Player (Linux via Docker, Win/Mac Native)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  # 如果你想打 tag 发布，取消下面注释
+  # release:
+  #   types: [published]
+
+env:
+  APP_NAME: VinePalmaPlayer
+  VERSION: 0.2.0
+
+jobs:
+
+  # ============================================================
+  # 1. LINUX 构建 —— 完全使用 Docker（满足你的要求）
+  # ============================================================
+  build-linux:
+    name: Linux (Docker) - ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            docker_tag: x86_64-latest
+          - arch: arm64
+            docker_tag: arm64-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 核心：拉取 Tauri 专用 Docker 镜像（已内置 Rust, Node, 所有 WebKit 依赖）
+      - name: Pull Tauri build image (${{ matrix.arch }})
+        run: docker pull liudonghua123/tauri-build:${{ matrix.docker_tag }}
+
+      # 在 Docker 容器内执行构建
+      - name: Build Tauri app inside Docker (${{ matrix.arch }})
+        run: |
+          docker run --rm \
+            -v $(pwd):/app \
+            -w /app \
+            liudonghua123/tauri-build:${{ matrix.docker_tag }} \
+            bash -c " \
+              npm config set registry https://registry.npmmirror.com && \
+              npm install && \
+              npm run tauri build \
+            "
+        env:
+          # 如果你配置了签名私钥，传入环境变量（可选）
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      # 上传 Linux 产物（.deb 和 .AppImage）
+      - name: Upload Linux artifacts (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: VinePalmaPlayer-Linux-${{ matrix.arch }}
+          path: src-tauri/target/release/bundle/
+          if-no-files-found: error
+
+  # ============================================================
+  # 2. WINDOWS 构建（原生运行器，保证兼容性）
+  # ============================================================
+  build-windows:
+    name: Windows (Native)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable (with MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install dependencies & Build
+        run: |
+          npm install
+          npm run tauri build
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VinePalmaPlayer-Windows
+          path: src-tauri/target/release/bundle/
+          if-no-files-found: error
+
+  # ============================================================
+  # 3. MACOS 构建（原生运行器，支持 Intel + Apple Silicon）
+  # ============================================================
+  build-macos:
+    name: macOS (Native) - ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable with targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies & Build (Target: ${{ matrix.target }})
+        run: |
+          npm install
+          npm run tauri build -- --target ${{ matrix.target }}
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          # macOS 公证（可选，如需发布到商店或公证书，配置以下 secrets）
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Upload macOS artifacts (${{ matrix.target }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: VinePalmaPlayer-macOS-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/
+          if-no-files-found: error

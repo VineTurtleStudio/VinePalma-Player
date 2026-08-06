@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>设置 - VinePalma</title>
+    <link rel="stylesheet" href="settings.css" />
+</head>
+<body>
+<div class="settings-container">
+    <div class="settings-header" data-tauri-drag-region>
+        <span class="settings-title">⚙️ 设置</span>
+        <button id="close-settings-btn" class="close-btn">✕</button>
+    </div>
+
+    <div class="settings-body">
+
+        <!-- 跟随月份（默认） -->
+        <div class="setting-group">
+            <label class="group-label">🎨 默认主题</label>
+            <div class="auto-card" id="auto-card" data-theme="auto">
+                <div class="auto-preview" id="auto-preview"></div>
+                <div class="auto-info">
+                    <div class="auto-title">🌙 跟随月份</div>
+                    <div class="auto-desc">默认按当前月份自动切换主题</div>
+                </div>
+                <div class="auto-check">✔</div>
+            </div>
+            <div class="auto-hint" id="auto-hint">当前月份：<b id="current-month"></b>，预览为当月主题</div>
+        </div>
+
+        <!-- 12 个月份主题 -->
+        <div class="setting-group">
+            <label class="group-label">🗓️ 月份主题</label>
+            <div class="month-grid" id="month-grid"></div>
+        </div>
+
+        <!-- 自定义主题 -->
+        <div class="setting-group">
+            <label class="group-label">🎨 自定义主题</label>
+            <div class="custom-card" id="custom-card" data-theme="custom">
+                <div class="custom-row">
+                    <span class="custom-label">背景色</span><input type="color" id="c-bg" />
+                    <span class="custom-label">主色调</span><input type="color" id="c-primary" />
+                </div>
+                <div class="custom-row">
+                    <span class="custom-label">强调色</span><input type="color" id="c-accent" />
+                    <span class="custom-label">文字色</span><input type="color" id="c-text" />
+                </div>
+                <div class="custom-row">
+                    <span class="custom-label">辅助色</span><input type="color" id="c-secondary" />
+                    <button id="apply-custom-btn" class="btn-primary">应用自定义</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+<script src="../theme.js"></script>
+<script src="settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,598 @@
+//! Media probing, decoding, remuxing and cover-art extraction, built on a
+//! minimal static FFmpeg (ffprobe + ffmpeg) shipped inside the app's resource
+//! directory (a `.deb` install therefore keeps them out of `/usr/bin`).
+//!
+//! Only the formats/codecs needed by a local player are compiled into the
+//! bundled ffmpeg, which is what keeps the installers small.
+//!
+//! Non-UTF8 (e.g. GBK-encoded) file names are supported by decoding through a
+//! temporary symlink whose name is always valid ASCII: the sidecar CLI only
+//! accepts `&str` arguments, so the mangled lossy string would otherwise make
+//! ffmpeg fail to open the file.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use tauri::{AppHandle, Manager};
+
+/// Every container/codec a local player is likely to meet.
+pub const MEDIA_EXTS: &[&str] = &[
+    // lossy & lossless audio
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape",
+    "aiff", "aif", "wv", "mpc", "tak", "tta", "alac", "amr", "au", "ac3",
+    "eac3", "dts", "dtshd", "dsf", "caf", "m4b", "mka",
+    // video containers
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "3gp", "3g2", "mpg",
+    "mpeg", "ts", "m2ts", "flv", "rm", "rmvb", "asf",
+];
+
+/// Extensions used in the native "open file" dialog filter.
+pub const DIALOG_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape",
+    "aiff", "aif", "wv", "mpc", "tak", "tta", "alac", "amr", "au", "ac3",
+    "eac3", "dts", "dsf", "caf", "m4b", "mka", "mp4", "m4v", "mkv", "webm",
+    "mov", "avi", "wmv", "3gp", "mpg", "mpeg", "ts", "m2ts", "flv", "rm",
+    "rmvb", "asf",
+];
+
+/// Containers the webview's `<video>` element can play natively (served as-is).
+const NATIVE_VIDEO_CONTAINERS: &[&str] = &["mp4", "m4v", "mov", "webm"];
+
+/// True when an MP4-family file has its `moov` (index) atom before the media
+/// data, so the browser can seek immediately. Videos whose index sits at the
+/// end (the common non-faststart case) are remuxed so seeking works.
+fn has_faststart(p: &Path) -> bool {
+    use std::fs::File;
+    use std::io::Read;
+    let mut f = match File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; 1_000_000];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let bytes = &buf[..n];
+
+    let mut moov: Option<usize> = None;
+    let mut mdat: Option<usize> = None;
+    for (i, w) in bytes.windows(4).enumerate() {
+        if w == b"moov" && moov.is_none() {
+            moov = Some(i);
+        } else if w == b"mdat" && mdat.is_none() {
+            mdat = Some(i);
+        }
+        if moov.is_some() && mdat.is_some() {
+            break;
+        }
+    }
+    match (moov, mdat) {
+        (Some(_), None) => true,       // index at the start, data stream beyond the scan window
+        (Some(m), Some(d)) => m < d,   // index before data -> faststart
+        _ => false,                    // no index visible (moov at end) -> not faststart
+    }
+}
+
+/// True when a video file can be served to the browser directly *and* seeking
+/// will work. WebM is always seekable; MP4-family files need a faststart index.
+pub fn is_native_seekable(p: &Path) -> bool {
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("webm") => true,
+//         Some(e) if NATIVE_VIDEO_CONTAINERS
+//             .iter()
+//             .any(|c| c.eq_ignore_ascii_case(e)) =>
+//         {
+//             has_faststart(p)
+//         }
+        _ => false,
+    }
+}
+
+/// Audio extensions the webview (GStreamer) can decode and seek natively, so
+/// we can stream the *original* file instead of paying for a full, slow
+/// transcode to an uncompressed WAV (which also makes seeking unreliable).
+/// Other audio codecs still fall back to a decoded WAV cache.
+const NATIVE_AUDIO_EXTS: &[&str] = &[
+    // lossy / container audio most players meet
+    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav",
+    "aiff", "aif", "caf", "ac3", "eac3", "alac", "mka",
+];
+
+pub fn is_native_audio(p: &Path) -> bool {
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => NATIVE_AUDIO_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Best-effort MIME type for a natively-streamed audio file. The webview mostly
+/// sniffs content, so a coarse mapping is fine.
+pub fn native_audio_content_type(p: &Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => match ext.to_lowercase().as_str() {
+            "mp3" | "m4a" | "m4b" | "aac" | "mp4" | "mka" => "audio/mpeg",
+            "ogg" | "oga" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "wav" | "aiff" | "aif" | "caf" => "audio/wav",
+            "ac3" | "eac3" => "audio/ac3",
+            _ => "audio/mpeg",
+        },
+        None => "audio/mpeg",
+    }
+}
+
+pub fn is_media_file(p: &Path) -> bool {
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => MEDIA_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+pub fn is_video_file(p: &Path) -> bool {
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => NATIVE_VIDEO_CONTAINERS
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(ext)),
+        None => false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackInfo {
+    pub path: String,
+    pub name: String,
+    pub duration: f64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub has_video: bool,
+    pub is_native_video: bool,
+}
+
+/// Run the bundled ffmpeg/ffprobe (shipped inside the app's resource dir, so a
+/// `.deb` install never touches `/usr/bin` and cannot fight the distro's own
+/// ffmpeg package) to completion and collect its output.
+fn run_sidecar(app: &AppHandle, bin: &str, args: &[&str]) -> Result<(bool, Vec<u8>, String), String> {
+    let path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("获取资源目录失败: {e}"))?
+        .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+
+    let output = std::process::Command::new(&path)
+        .args(args)
+        .output()
+        .map_err(|e| format!("执行 {bin} ({}) 失败: {e}", path.display()))?;
+
+    Ok((
+        output.status.success(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// Recursively collect every media file inside `dir`.
+pub fn scan_media_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if is_media_file(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Encoding of file paths into stream/cover query keys (base64url, no padding).
+// ---------------------------------------------------------------------------
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+
+pub fn encode_key(path: &Path) -> String {
+    URL_SAFE_NO_PAD.encode(path.as_os_str().as_encoded_bytes())
+}
+
+pub fn decode_key(key: &str) -> Option<PathBuf> {
+    URL_SAFE_NO_PAD
+        .decode(key)
+        .ok()
+        .and_then(|b| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                Some(PathBuf::from(std::ffi::OsString::from_vec(b)))
+            }
+            #[cfg(not(unix))]
+            {
+                String::from_utf8(b).ok().map(PathBuf::from)
+            }
+        })
+}
+
+/// A short (16 hex chars) stable hash of a path, used for cache *file names*.
+/// The full base64 key can exceed the 255-byte filename limit on long paths
+/// (ENAMETOOLONG), so file names always use this hash instead.
+pub fn short_key(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+    }
+    format!("{hash:016x}")
+}
+
+/// Create a temporary ASCII-named handle pointing at `src`, so the ffmpeg
+/// sidecar can open files whose real name is not valid UTF-8.
+/// On Unix this is a symlink; on Windows a copy (Windows names are UTF-16, so
+/// the problematic case basically does not exist there).
+/// Returns the handle path (which lives inside `cache_dir`).
+fn safe_link(cache_dir: &Path, src: &Path, tag: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(cache_dir.join("src")).ok();
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let name = format!("{tag}-{}.{}", short_key(src), ext);
+    let link = cache_dir.join("src").join(&name);
+    if link.exists() {
+        return Ok(link);
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, &link)
+            .map_err(|e| format!("无法创建符号链接: {e}"))?;
+    }
+    #[cfg(windows)]
+    {
+        std::fs::copy(src, &link).map_err(|e| format!("无法复制文件: {e}"))?;
+    }
+    Ok(link)
+}
+
+fn get_json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+/// Probe a single file with ffprobe and build its TrackInfo.
+fn track_info(app: &AppHandle, cache_dir: &Path, path: &Path) -> TrackInfo {
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+    let mut duration = 0.0f64;
+    let (mut title, mut artist, mut album) = (None, None, None);
+    let mut has_video = false;
+
+    if let Some(link) = safe_link(cache_dir, path, "probe").ok() {
+        if let Some(s) = link.to_str() {
+            let args = [
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                s,
+            ];
+            if let Ok((ok, out, _)) = run_sidecar(app, "ffprobe", &args) {
+                if ok {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out) {
+                        let format = &json["format"];
+                        duration = format["duration"]
+                            .as_str()
+                            .and_then(|d| d.parse().ok())
+                            .unwrap_or(0.0);
+                        let tags = &format["tags"];
+                        title = get_json_str(tags, &["title"]);
+                        artist = get_json_str(tags, &["artist", "album_artist"]);
+                        album = get_json_str(tags, &["album"]);
+                        if let Some(streams) = json["streams"].as_array() {
+                            for s in streams {
+                                let ct = s["codec_type"].as_str().unwrap_or("");
+                                // An attached picture (embedded cover) is not a video
+                                // stream, so skip it when deciding video-ness.
+                                if ct == "video"
+                                    && s["disposition"]["attached_pic"]
+                                        .as_i64()
+                                        .unwrap_or(0)
+                                        != 1
+                                {
+                                    has_video = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let title = title.unwrap_or_else(|| name.clone());
+    let artist = artist.unwrap_or_else(|| "未知艺术家".to_string());
+    let album = album.unwrap_or_default();
+
+    TrackInfo {
+        path: encode_key(path),
+        name,
+        duration,
+        title,
+        artist,
+        album,
+        has_video,
+        is_native_video: is_video_file(path),
+    }
+}
+
+/// Probe a list of files in parallel and preserve the given order.
+pub fn probe_all(app: &AppHandle, cache_dir: &Path, paths: Vec<PathBuf>) -> Vec<TrackInfo> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(4)
+        .min(8);
+
+    let app = app.clone();
+    let paths = Arc::new(paths);
+    let cache = Arc::new(cache_dir.to_path_buf());
+    let next = Arc::new(AtomicUsize::new(0));
+    let out: Arc<Mutex<Vec<Option<TrackInfo>>>> =
+        Arc::new(Mutex::new((0..n).map(|_| None).collect()));
+
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let (app, paths, cache, next, out) = (app.clone(), paths.clone(), cache.clone(), next.clone(), out.clone());
+        handles.push(std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let info = track_info(&app, &cache, &paths[i]);
+            if let Some(slot) = out.lock().unwrap().get_mut(i) {
+                *slot = Some(info);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    Arc::try_unwrap(out)
+        .ok()
+        .map(|m| m.into_inner().unwrap())
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Decode `src` to a PCM WAV file at `dst` (any supported input -> s16le WAV).
+pub fn decode_to_wav(
+    app: &AppHandle,
+    cache_dir: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<(), String> {
+    let link = safe_link(cache_dir, src, "dec")?;
+    let link_str = link.to_string_lossy().into_owned();
+    let dst_str = dst.to_string_lossy().into_owned();
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        link_str.as_str(),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        dst_str.as_str(),
+    ];
+    let (ok, _, err) = run_sidecar(app, "ffmpeg", &args)?;
+    if ok && dst.exists() {
+        Ok(())
+    } else {
+        Err(format!("解码失败: {err}"))
+    }
+}
+
+/// Extract the embedded cover art (or first video frame) as a JPEG.
+/// Returns false when the file has no picture track.
+pub fn extract_cover(
+    app: &AppHandle,
+    cache_dir: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<bool, String> {
+    let link = safe_link(cache_dir, src, "cov")?;
+    let link_str = link.to_string_lossy().into_owned();
+    let dst_str = dst.to_string_lossy().into_owned();
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        link_str.as_str(),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "mjpeg",
+        "-q:v",
+        "3",
+        dst_str.as_str(),
+    ];
+    let (ok, _, _) = run_sidecar(app, "ffmpeg", &args)?;
+    Ok(ok && dst.exists())
+}
+
+/// Remux `src` into a browser-friendly container.
+///
+/// Layered strategy, fastest to slowest:
+/// 1. stream-copy (no re-encode) into MP4, index moved to the front;
+/// 2. stream-copy into WebM (only possible with VP8/VP9 + Vorbis/Opus);
+/// 3. re-encode into MP4 — H.264 + AAC when libx264 is compiled in, otherwise
+///    the built-in MPEG-4 + AAC. Slower, but works for virtually any input,
+///    which is what fixes "stream-copy fails -> video won't play" cases.
+///
+/// Each attempt is logged so success/failure can be diagnosed.
+/// Returns the path of the produced file on success.
+pub fn remux_video(
+    app: &AppHandle,
+    cache_dir: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<PathBuf, String> {
+    let link = safe_link(cache_dir, src, "vid")?;
+    let link_str = link.to_string_lossy().into_owned();
+    let mut last_err = String::new();
+
+    // 1) 流复制（-c copy，不重编码）：MP4 优先，其次 WebM。
+    for container in ["mp4", "webm"] {
+        let out = dst.with_extension(container);
+        let out_str = out.to_string_lossy().into_owned();
+        let args = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            link_str.as_str(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "faststart",
+            "-f",
+            container,
+            out_str.as_str(),
+        ];
+        match run_sidecar(app, "ffmpeg", &args) {
+            Ok((true, _, _)) if out.exists() => {
+                crate::log::log(&format!("[remux] {container} 流复制成功 -> {out_str}"));
+                return Ok(out);
+            }
+            Ok((_, _, err)) => {
+                crate::log::log(&format!("[remux] {container} 流复制失败: {err}"));
+                last_err = err;
+            }
+            Err(e) => {
+                crate::log::log(&format!("[remux] {container} 执行失败: {e}"));
+                last_err = e;
+            }
+        }
+    }
+
+    // 2) 重编码回退：H.264+AAC 兼容性最好；本构建没带 libx264 时用内置的
+    //    MPEG-4 编码器兜底，保证这条路径一定能产出一个可播放的 MP4。
+    for vcodec in ["libx264", "mpeg4"] {
+        let out = dst.with_extension("mp4");
+        let out_str = out.to_string_lossy().into_owned();
+        let args = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            link_str.as_str(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            vcodec,
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "faststart",
+            "-f",
+            "mp4",
+            out_str.as_str(),
+        ];
+        match run_sidecar(app, "ffmpeg", &args) {
+            Ok((true, _, _)) if out.exists() => {
+                crate::log::log(&format!("[remux] mp4 重编码({vcodec})成功 -> {out_str}"));
+                return Ok(out);
+            }
+            Ok((_, _, err)) => {
+                crate::log::log(&format!("[remux] mp4 重编码({vcodec})失败: {err}"));
+                last_err = err;
+            }
+            Err(e) => {
+                crate::log::log(&format!("[remux] mp4 重编码({vcodec})执行失败: {e}"));
+                last_err = e;
+            }
+        }
+    }
+
+    Err(format!(
+        "该视频流复制与重编码均无法转为可播放格式，最后错误: {last_err}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn faststart_detection() {
+        assert!(has_faststart(&write_tmp("vp_fast.mp4", b"moovmdatXXXX")));
+        assert!(!has_faststart(&write_tmp("vp_late.mp4", b"mdatmoovXXXX")));
+        assert!(!has_faststart(&write_tmp("vp_none.mp4", b"XXXXXXXXXXXX")));
+        assert!(!has_faststart(&PathBuf::from("/nonexistent/file.mp4")));
+    }
+
+    #[test]
+    fn faststart_scans_beyond_1mb() {
+        // moov far past the 1 MB scan window => not faststart
+        let mut bytes = Vec::new();
+        bytes.extend(std::iter::repeat_n(b'x', 2_000_000));
+        bytes.extend_from_slice(b"moov");
+        let p = write_tmp("vp_big.mp4", &bytes);
+        assert!(!has_faststart(&p));
+        // moov near the start with a huge data section => faststart
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"moov");
+        bytes.extend(std::iter::repeat_n(b'x', 2_000_000));
+        let p = write_tmp("vp_big2.mp4", &bytes);
+        assert!(has_faststart(&p));
+    }
+}

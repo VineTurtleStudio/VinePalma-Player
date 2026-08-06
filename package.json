@@ -1,0 +1,17 @@
+{
+  "name": "vinepalma-player",
+  "version": "0.1.0",
+  "description": "基于 FFmpeg 的现代化本地播放器 (Tauri)",
+  "private": true,
+  "scripts": {
+    "tauri": "cargo tauri",
+    "dev": "cargo tauri dev",
+    "build": "cargo tauri build",
+    "build:linux": "cargo tauri build --bundles deb appimage",
+    "build:windows": "cargo tauri build --target x86_64-pc-windows-gnu --bundles nsis",
+    "build:ffmpeg:linux": "bash scripts/build-ffmpeg-linux.sh",
+    "build:ffmpeg:windows": "bash scripts/build-ffmpeg-windows.sh"
+  },
+  "author": "VineTurtleStudio Dev <VineTurtleStudio@outlook.com>",
+  "license": "ISC"
+}

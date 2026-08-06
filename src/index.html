@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VinePalma Player</title>
+    <link rel="stylesheet" href="index.css" />
+</head>
+<body>
+
+<div id="app">
+
+    <!-- ===== 顶部栏（含窗口控制 + 置顶/全屏/迷你播放器） ===== -->
+    <header class="app-header" data-tauri-drag-region>
+        <div class="logo">
+            <span class="logo-icon">🎵</span>
+            <span class="logo-text">VinePalma</span>
+        </div>
+        <div class="header-actions">
+            <button id="pin-btn" class="btn-ghost btn-icon" title="置顶">📌</button>
+            <button id="window-fullscreen-btn" class="btn-ghost btn-icon" title="窗口全屏">⛶</button>
+            <button id="content-fullscreen-btn" class="btn-ghost btn-icon" title="内容全屏">🖥</button>
+            <button id="mini-btn" class="btn-ghost btn-icon" title="迷你播放器">🎴</button>
+            <!-- 设置按钮 -->
+            <button id="settings-btn" class="btn-ghost btn-icon" title="设置">⚙️</button>
+            <!-- 窗口控制按钮 -->
+            <button id="min-btn" class="window-control" title="最小化">─</button>
+            <button id="close-btn" class="window-control close-btn" title="关闭">✕</button>
+            <!-- 播放列表切换按钮 -->
+            <button id="menu-toggle-btn" class="btn-ghost btn-icon" title="播放列表">☰</button>
+        </div>
+    </header>
+
+    <!-- ===== 主播放区（视频/封面垂直居中，占满剩余空间） ===== -->
+    <main class="player-main">
+
+        <!-- 视频播放区（仅视频文件时显示，自动按比例放大填满中间区域） -->
+        <div class="video-wrap" id="video-wrap">
+            <video id="video-player" playsinline preload="auto"></video>
+            <!-- 悬停浮层：播放/暂停 + 内容全屏 -->
+            <div class="video-overlay" id="video-overlay">
+                <button id="video-play" class="video-btn video-primary" title="播放/暂停">⏸</button>
+                <div class="video-overlay-spacer"></div>
+                <button id="video-fullscreen" class="video-btn" title="内容全屏">⛶</button>
+            </div>
+            <!-- PotPlayer 风格底部进度条（视频播放时始终可用） -->
+            <div class="video-seek" id="video-seek">
+                <span class="stage-time" id="video-current">0:00</span>
+                <input type="range" id="video-progress" class="progress-slider" min="0" max="1000" value="0" />
+                <span class="stage-time" id="video-total">0:00</span>
+            </div>
+        </div>
+
+        <!-- 封面 + 歌曲信息（音频播放时显示） -->
+        <div class="cover-section" id="cover-section">
+            <div class="cover-art" id="cover-art">
+                <img id="cover-image" src="" alt="封面" style="display:none; width:100%; height:100%; object-fit:cover; border-radius:20px;" />
+
+                <!-- 默认封面（无封面音频时显示） -->
+                <img id="cover-placeholder" src="default-cover.png" alt="默认封面" style="display:none; width:100%; height:100%; object-fit:cover; border-radius:20px;" />
+            </div>
+
+            <div class="song-info">
+                <div class="song-name" id="song-title">未选择歌曲</div>
+                <div class="song-artist" id="song-artist">本地文件</div>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- ===== 底部固定区：进度条 + 控制按钮 + 状态 ===== -->
+    <div class="bottom-fixed">
+        <div class="progress-area">
+            <span class="time-label" id="current-time">0:00</span>
+            <input type="range" id="progress-bar" class="progress-slider" min="0" max="1000" value="0" />
+            <span class="time-label" id="total-time">0:00</span>
+        </div>
+
+        <div class="controls-group">
+            <button id="mode-btn" class="ctrl-btn" title="列表循环">🔁</button>
+            <button id="prev-btn" class="ctrl-btn" title="上一首">⏮</button>
+            <button id="play-toggle-btn" class="ctrl-btn primary-btn" title="播放/暂停">▶</button>
+            <!-- 保留原有 play / pause 按钮（隐藏） -->
+            <button id="play-btn" style="display:none;">▶</button>
+            <button id="pause-btn" style="display:none;">⏸</button>
+            <button id="next-btn" class="ctrl-btn" title="下一首">⏭</button>
+
+            <!-- 音量 -->
+            <div class="volume-wrap">
+                <span class="volume-icon" id="volume-icon">🔊</span>
+                <input type="range" id="volume-slider" class="volume-slider" min="0" max="100" value="80" />
+            </div>
+        </div>
+
+        <div id="status" class="status-bar">✅ 就绪</div>
+    </div>
+
+    <!-- ===== 内容全屏时的悬浮退出按钮（默认隐藏） ===== -->
+    <button id="exit-content-fullscreen-btn" class="exit-fullscreen-btn" title="退出内容全屏 (Esc)">✕ 退出全屏</button>
+
+    <!-- ===== 侧滑播放列表 ===== -->
+    <aside class="playlist-panel" id="playlist-panel">
+        <div class="playlist-header">
+            <span class="playlist-title">📋 播放列表</span>
+            <span class="playlist-count" id="playlist-count">(0 首)</span>
+            <button id="clear-playlist-btn" class="btn-ghost-sm" title="清空列表">🗑</button>
+            <button id="close-playlist-btn" class="btn-ghost-sm" title="关闭列表">✕</button>
+        </div>
+        <ul class="playlist" id="playlist"></ul>
+        <div class="playlist-empty" id="playlist-empty">暂无歌曲，点击下方按钮添加</div>
+        <!-- 文件操作：固定在播放列表底部，始终可见 -->
+        <div class="playlist-footer">
+            <button id="open-btn" class="btn-primary footer-btn">📁 选择文件</button>
+            <button id="open-folder-btn" class="btn-primary footer-btn footer-btn-alt">📂 导入文件夹</button>
+            <span class="file-hint" id="file-info"></span>
+        </div>
+    </aside>
+
+    <!-- ===== 隐藏的音频元素 ===== -->
+    <audio id="audio-player" style="display:none;"></audio>
+
+    <!-- 进度条悬停/拖动时的时间提示（跟随鼠标） -->
+    <div id="seek-tooltip" class="seek-tooltip" style="display:none;">0:00</div>
+
+</div>
+
+<script src="theme.js"></script>
+<script src="index.js"></script>
+</body>
+</html>

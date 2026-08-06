@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "binaries/ffmpeg-x86_64-unknown-linux-gnu": "ffmpeg",
+      "binaries/ffprobe-x86_64-unknown-linux-gnu": "ffprobe"
+    }
+  }
+}

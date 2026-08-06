@@ -1,0 +1,158 @@
+/* ===== 迷你播放器小卡片（网易云风格，始终置顶） ===== */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+}
+
+.mini-card {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    background: linear-gradient(150deg, #2f2f38, #1c1d24);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+    color: #f2f2f5;
+    cursor: grab;
+    user-select: none;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    backdrop-filter: blur(18px);
+}
+
+/* 封面：最左侧，带圆角与高光描边 */
+.mini-cover {
+    width: 44px;
+    height: 44px;
+    border-radius: 9px;
+    overflow: hidden;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(145deg, #3d3d47, #26262e);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.mini-cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.mini-cover-ph {
+    font-size: 18px;
+    opacity: 0.55;
+}
+
+/* 标题 + 进度 */
+.mini-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+}
+.mini-titles {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+.mini-title {
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    letter-spacing: 0.2px;
+}
+.mini-artist {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.mini-progress {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.mini-time {
+    font-size: 9px;
+    color: rgba(255, 255, 255, 0.5);
+    min-width: 24px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+.mini-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 3px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.18);
+    outline: none;
+    cursor: pointer;
+}
+.mini-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #fca877;
+    box-shadow: 0 0 8px rgba(252, 168, 119, 0.6);
+    cursor: pointer;
+}
+
+/* 控制按钮 */
+.mini-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+.mini-btn {
+    width: 24px;
+    height: 24px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.08);
+    color: #eee;
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, transform 0.1s;
+}
+.mini-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+.mini-btn:active {
+    transform: scale(0.92);
+}
+.mini-primary {
+    width: 30px;
+    height: 30px;
+    font-size: 14px;
+    background: linear-gradient(135deg, #fca877, #e68a57);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(252, 168, 119, 0.4);
+}
+.mini-primary:hover {
+    background: linear-gradient(135deg, #fca877, #e68a57);
+    transform: scale(1.06);
+}
+.mini-close:hover {
+    background: #e81123;
+}
