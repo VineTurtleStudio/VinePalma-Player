@@ -109,31 +109,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        target: [ x86_64-apple-darwin, aarch64-apple-darwin ]
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: '20'
 
       - name: Install Rust stable with targets
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install dependencies & Build (Target: ${{ matrix.target }})
+      - name: "Install dependencies and Build (Target: ${{ matrix.target }})"
         run: |
           npm install
           npm run tauri build -- --target ${{ matrix.target }}
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-          # macOS 公证（可选，如需发布到商店或公证书，配置以下 secrets）
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: Upload macOS artifacts (${{ matrix.target }})
         uses: actions/upload-artifact@v4
