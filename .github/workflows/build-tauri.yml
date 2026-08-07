@@ -1,13 +1,11 @@
-name: Build VinePalma Player (Linux via Docker, Win/Mac Native)
+name: Build VinePalma Player (Linux, Win/Mac Native)
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # 如果你想打 tag 发布，取消下面注释
-  # release:
-  #   types: [published]
+  workflow_dispatch:
 
 env:
   APP_NAME: VinePalmaPlayer
@@ -16,58 +14,60 @@ env:
 jobs:
 
   # ============================================================
-  # 1. LINUX 构建 —— 完全使用 Docker（满足你的要求）
+  # 1. LINUX 构建 —— 原生 ubuntu 运行器（不用 Docker，更稳定）
   # ============================================================
   build-linux:
-    name: Linux (Docker) - ${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    name: Linux - ${{ matrix.arch }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, arm64]
+        arch: [x86_64, aarch64]
         include:
           - arch: x86_64
-            docker_tag: x86_64-latest
-          - arch: arm64
-            docker_tag: arm64-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            rust_target: aarch64-unknown-linux-gnu
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
 
-      # 核心：拉取 Tauri 专用 Docker 镜像（已内置 Rust, Node, 所有 WebKit 依赖）
-      - name: Pull Tauri build image (${{ matrix.arch }})
-        run: docker pull liudonghua123/tauri-build:${{ matrix.docker_tag }}
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
-      # 在 Docker 容器内执行构建
-      - name: Build Tauri app inside Docker (${{ matrix.arch }})
+      - name: Install Linux dependencies
         run: |
-          docker run --rm \
-            -v $(pwd):/app \
-            -w /app \
-            liudonghua123/tauri-build:${{ matrix.docker_tag }} \
-            bash -c " \
-              npm config set registry https://registry.npmmirror.com && \
-              npm install && \
-              npm run tauri build \
-            "
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install cargo-tauri
+        run: cargo install tauri-cli --locked
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        run: cargo tauri build --target ${{ matrix.rust_target }}
         env:
-          # 如果你配置了签名私钥，传入环境变量（可选）
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
-      # 上传 Linux 产物（.deb 和 .AppImage）
-      - name: Upload Linux artifacts (${{ matrix.arch }})
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VinePalmaPlayer-Linux-${{ matrix.arch }}
-          path: src-tauri/target/release/bundle/
+          path: src-tauri/target/${{ matrix.rust_target }}/release/bundle/
           if-no-files-found: error
 
   # ============================================================
-  # 2. WINDOWS 构建（原生运行器，保证兼容性）
+  # 2. WINDOWS 构建
   # ============================================================
   build-windows:
     name: Windows (Native)
@@ -80,15 +80,19 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Install Rust stable (with MSVC target)
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install dependencies & Build
-        run: |
-          npm install
-          npm run tauri build
+      - name: Install cargo-tauri
+        run: cargo install tauri-cli --locked
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        run: cargo tauri build
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -100,38 +104,42 @@ jobs:
           path: src-tauri/target/release/bundle/
           if-no-files-found: error
 
-   # ============================================================
-  # 3. MACOS 构建（原生运行器，支持 Intel + Apple Silicon）
+  # ============================================================
+  # 3. MACOS 构建（Intel + Apple Silicon）
   # ============================================================
   build-macos:
-    name: macOS (Native) - ${{ matrix.target }}
+    name: macOS - ${{ matrix.target }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [ x86_64-apple-darwin, aarch64-apple-darwin ]
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: lts/*
 
-      - name: Install Rust stable with targets
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: "Install dependencies and Build (Target: ${{ matrix.target }})"
-        run: |
-          npm install
-          npm run tauri build -- --target ${{ matrix.target }}
+      - name: Install cargo-tauri
+        run: cargo install tauri-cli --locked
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        run: cargo tauri build --target ${{ matrix.target }}
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
-      - name: Upload macOS artifacts (${{ matrix.target }})
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VinePalmaPlayer-macOS-${{ matrix.target }}
