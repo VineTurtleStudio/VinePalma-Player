@@ -3,16 +3,17 @@
 # cross-compiled from Linux with mingw-w64. Same trimmed component set as the
 # Linux build, so the bundled sidecars stay small.
 #
-# Optional: set ENABLE_X264=1 to also cross-build a static x264 and enable the
-# H.264 encoder (used by the remux re-encode fallback). It is off by default
-# because mingw cross-builds of x264 are more fragile; without it the re-encode
-# fallback simply uses the built-in MPEG-4 + AAC encoders.
+# Optional: set ENABLE_X264=0 to skip the H.264 encoder. It is ON by default
+# because the re-encode fallback (remux_video) must produce H.264: Chromium /
+# WebView2 (Windows Edge) cannot decode MPEG-4 Part 2 (`mpeg4`), so without
+# libx264 the fallback would only ever make "video shows no picture" on Windows.
 set -euo pipefail
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.2}"
 BUILD_DIR="${BUILD_DIR:-/tmp/opencode/ffmpeg-build}"
 OUT_DIR="${OUT_DIR:-$(cd "$(dirname "$0")/.." && pwd)/src-tauri/binaries}"
 JOBS="${JOBS:-$(nproc)}"
+ENABLE_X264="${ENABLE_X264:-1}"
 SRC_TARBALL="${SRC_TARBALL:-$BUILD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz}"
 BUILD_WIN_DIR="$BUILD_DIR/ffmpeg-win-$FFMPEG_VERSION"
 

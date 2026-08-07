@@ -79,21 +79,36 @@ impl StreamState {
     }
 
     /// Produce a streamable video file (idempotent): returns the original file
-    /// when its container is already browser-native *and* seekable (faststart),
-    /// otherwise remuxes a copy so the index sits at the front.
+    /// when its container is already browser-native *and* seekable (faststart)
+    /// *and* the codec is decodable by this platform's webview; otherwise
+    /// remuxes/re-encodes a copy so playback works and the index sits at front.
     pub fn ensure_video(&self, path: &std::path::Path) -> Result<PathBuf, String> {
         let key = media::short_key(path);
         if let Some(p) = self.videos.lock().unwrap().get(&key) {
             return Ok(p.clone());
         }
 
-        let resolved = if media::is_native_seekable(path) {
-            crate::log::log(&format!("VIDEO {} 原生容器可用，直接服务", path.display()));
+        let native = media::is_native_seekable(path)
+            && media::video_codec(&self.app, &self.cache_dir, path)
+                .map(|c| media::webview_can_decode_video(&c))
+                .unwrap_or(true);
+
+        let resolved = if native {
+            crate::log::log(&format!(
+                "VIDEO {} 原生容器+可解码 codec，直接服务",
+                path.display()
+            ));
             path.to_path_buf()
         } else {
-            crate::log::log(&format!("VIDEO {} 需要 remux", path.display()));
+            let codec = media::video_codec(&self.app, &self.cache_dir, path)
+                .unwrap_or_else(|| "未知".into());
+            let force_encode = !media::webview_can_decode_video(&codec);
+            crate::log::log(&format!(
+                "VIDEO {} codec={codec} 需要 remux (force_encode={force_encode})",
+                path.display()
+            ));
             let dst = self.cache_dir.join(format!("{key}-remux"));
-            let out = media::remux_video(&self.app, &self.cache_dir, path, &dst)?;
+            let out = media::remux_video(&self.app, &self.cache_dir, path, &dst, force_encode)?;
             crate::log::log(&format!("VIDEO remux 完成 -> {}", out.display()));
             out
         };

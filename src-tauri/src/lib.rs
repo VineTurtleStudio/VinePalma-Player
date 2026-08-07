@@ -230,14 +230,23 @@ fn open_settings(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Position the mini player near the bottom-right of the primary monitor.
+/// Position the mini player near the bottom-right of the monitor that currently
+/// holds the main window (falling back to the primary monitor).
+/// `Monitor::position()/size()` are physical pixels; `WebviewWindowBuilder::position`
+/// expects logical pixels, so convert with the monitor scale factor (otherwise on
+/// Windows DPI scaling >100% the card is placed off-screen and never appears).
 fn bottom_right(app: &AppHandle, w: f64, h: f64) -> (f64, f64) {
-    if let Ok(Some(mon)) = app.primary_monitor() {
+    let mon = app
+        .get_webview_window("main")
+        .and_then(|m| m.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    if let Some(mon) = mon {
+        let scale = mon.scale_factor().max(1.0);
         let pos = mon.position();
         let size = mon.size();
         let margin = 24.0f64;
-        let x = pos.x as f64 + size.width as f64 - w - margin;
-        let y = pos.y as f64 + size.height as f64 - h - margin;
+        let x = pos.x as f64 / scale + size.width as f64 / scale - w - margin;
+        let y = pos.y as f64 / scale + size.height as f64 / scale - h - margin;
         (x.max(0.0), y.max(0.0))
     } else {
         (0.0, 0.0)
@@ -364,6 +373,13 @@ fn store_set(
 
 
 /// 修复 Linux 透明窗口“整个窗口鼠标穿透、无法点击”的问题。
+///
+/// 根因：透明窗口下 WebKitGTK 会按页面内容的 alpha 计算“输入形状区域”
+/// （input shape）。`<body>` 背景透明时，窗口在首次渲染、尺寸变化或地图后
+/// 都可能被 WebKit 重新判定为全部穿透。单纯在 `map` 时重置一次不够——若重置
+/// 发生在 WebKit 首次绘制（第一帧透明）之前，之后 WebKit 又会把整窗设为
+/// 点击穿透，且此后不再触发 `map`。这里在启动窗口内多次延时重置输入区域，
+/// 覆盖 map → 首帧绘制这段竞态（即“低概率打开时鼠标点不中”的来源）。
 #[cfg(target_os = "linux")]
 fn fix_transparent_click_through(app: &tauri::AppHandle, label: &str) {
     use gtk::prelude::*;
@@ -372,19 +388,28 @@ fn fix_transparent_click_through(app: &tauri::AppHandle, label: &str) {
     let Some(w) = app.get_webview_window(label) else { return };
     let Ok(gtk_win) = w.gtk_window() else { return };
 
-    let reset = {
-        let win = gtk_win.clone();
-        move || {
-            win.input_shape_combine_region(None::<&gtk::cairo::Region>);
-            for child in win.children() {
-                if let Ok(view) = child.downcast::<webkit2gtk::WebView>() {
-                    view.input_shape_combine_region(None::<&gtk::cairo::Region>);
-                }
+    fn reset_input_region(win: &gtk::Window) {
+        win.input_shape_combine_region(None::<&gtk::cairo::Region>);
+        for child in win.children() {
+            if let Ok(view) = child.downcast::<webkit2gtk::WebView>() {
+                view.input_shape_combine_region(None::<&gtk::cairo::Region>);
             }
         }
-    };
-    reset();
-    gtk_win.connect_map(move |_| reset());
+    }
+
+    reset_input_region(&gtk_win.clone().upcast::<gtk::Window>());
+    // 在启动竞态窗口内反复重置（0/100/300/800ms），而不是只在 map 时一次。
+    for delay_ms in [0u32, 100, 300, 800, 2000] {
+        let win = gtk_win.clone();
+        gtk::glib::timeout_add_local(
+            std::time::Duration::from_millis(delay_ms as u64),
+            move || {
+                reset_input_region(&win.clone().upcast::<gtk::Window>());
+                gtk::glib::ControlFlow::Break
+            },
+        );
+    }
+    gtk_win.connect_map(|win| reset_input_region(&win.clone().upcast::<gtk::Window>()));
 }
 
 

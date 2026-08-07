@@ -78,12 +78,12 @@ fn has_faststart(p: &Path) -> bool {
 pub fn is_native_seekable(p: &Path) -> bool {
     match p.extension().and_then(|e| e.to_str()) {
         Some(e) if e.eq_ignore_ascii_case("webm") => true,
-//         Some(e) if NATIVE_VIDEO_CONTAINERS
-//             .iter()
-//             .any(|c| c.eq_ignore_ascii_case(e)) =>
-//         {
-//             has_faststart(p)
-//         }
+        Some(e) if NATIVE_VIDEO_CONTAINERS
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(e)) =>
+        {
+            has_faststart(p)
+        }
         _ => false,
     }
 }
@@ -92,10 +92,27 @@ pub fn is_native_seekable(p: &Path) -> bool {
 /// we can stream the *original* file instead of paying for a full, slow
 /// transcode to an uncompressed WAV (which also makes seeking unreliable).
 /// Other audio codecs still fall back to a decoded WAV cache.
+///
+/// The two platforms use different webview engines, so the set of formats that
+/// can be *streamed as-is* differs:
+/// - Linux: WebKitGTK + GStreamer (avdec_*) — very broad codec support.
+/// - Windows: WebView2 / Chromium — narrower; no AIFF, AC3/EAC3 or Matroska
+///   audio. Those are intentionally *omitted* from the Windows native list so
+///   they go through the ffmpeg→WAV fallback instead (preserving format parity
+///   with Linux, since ffmpeg decodes them identically on both platforms).
+#[cfg(not(target_os = "windows"))]
 const NATIVE_AUDIO_EXTS: &[&str] = &[
     // lossy / container audio most players meet
     "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav",
     "aiff", "aif", "caf", "ac3", "eac3", "alac", "mka",
+];
+
+#[cfg(target_os = "windows")]
+const NATIVE_AUDIO_EXTS: &[&str] = &[
+    // Chromium-native: MP3, AAC, Ogg/Opus, FLAC, WAV, ALAC-in-CAF/MP4.
+    // aiff/aif, ac3, eac3, mka 不在此列 → 走 ffmpeg→WAV 回退。
+    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav",
+    "caf", "alac",
 ];
 
 pub fn is_native_audio(p: &Path) -> bool {
@@ -137,6 +154,45 @@ pub fn is_video_file(p: &Path) -> bool {
     }
 }
 
+/// Video codecs Chromium / WebView2 (Windows Edge) can decode in a `<video>`.
+/// Linux (WebKitGTK + GStreamer avdec_*) plays almost anything, so the native
+/// direct-serve / stream-copy path is fine there; on Windows these are the only
+/// codecs that can be served without an H.264 re-encode.
+#[cfg(target_os = "windows")]
+const CHROMIUM_VIDEO_CODECS: &[&str] = &["h264", "avc1", "vp8", "vp9", "av1"];
+
+/// True when the current platform's webview can natively decode `codec`.
+#[cfg(target_os = "windows")]
+pub fn webview_can_decode_video(codec: &str) -> bool {
+    CHROMIUM_VIDEO_CODECS.contains(&codec)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn webview_can_decode_video(_codec: &str) -> bool {
+    true
+}
+
+/// Probe the primary video stream's codec name (e.g. "h264", "hevc", "mpeg4").
+/// Returns None when probing fails or the file has no real video stream.
+pub fn video_codec(app: &AppHandle, cache_dir: &Path, path: &Path) -> Option<String> {
+    let link = safe_link(cache_dir, path, "probe").ok()?;
+    let s = link.to_str()?;
+    let args = ["-v", "quiet", "-print_format", "json", "-show_streams", s];
+    let (ok, out, _) = run_sidecar(app, "ffprobe", &args).ok()?;
+    if !ok {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out).ok()?;
+    json["streams"]
+        .as_array()?
+        .iter()
+        .find(|st| {
+            st["codec_type"].as_str() == Some("video")
+                && st["disposition"]["attached_pic"].as_i64().unwrap_or(0) != 1
+        })
+        .and_then(|st| st["codec_name"].as_str().map(String::from))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackInfo {
     pub path: String,
@@ -159,8 +215,17 @@ fn run_sidecar(app: &AppHandle, bin: &str, args: &[&str]) -> Result<(bool, Vec<u
         .map_err(|e| format!("获取资源目录失败: {e}"))?
         .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
 
-    let output = std::process::Command::new(&path)
-        .args(args)
+    let mut cmd = std::process::Command::new(&path);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        // ffmpeg/ffprobe 是 console 子系统二进制，GUI 应用直接 spawn 会弹黑窗。
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
         .output()
         .map_err(|e| format!("执行 {bin} ({}) 失败: {e}", path.display()))?;
 
@@ -456,6 +521,10 @@ pub fn extract_cover(
 ///    the built-in MPEG-4 + AAC. Slower, but works for virtually any input,
 ///    which is what fixes "stream-copy fails -> video won't play" cases.
 ///
+/// When `force_encode` is set (codec the webview can't decode, e.g. HEVC on
+/// Windows), the stream-copy steps are skipped entirely and we go straight to
+/// the H.264 re-encode, since a preserved incompatible codec would still fail.
+///
 /// Each attempt is logged so success/failure can be diagnosed.
 /// Returns the path of the produced file on success.
 pub fn remux_video(
@@ -463,54 +532,62 @@ pub fn remux_video(
     cache_dir: &Path,
     src: &Path,
     dst: &Path,
+    force_encode: bool,
 ) -> Result<PathBuf, String> {
     let link = safe_link(cache_dir, src, "vid")?;
     let link_str = link.to_string_lossy().into_owned();
     let mut last_err = String::new();
 
     // 1) 流复制（-c copy，不重编码）：MP4 优先，其次 WebM。
-    for container in ["mp4", "webm"] {
-        let out = dst.with_extension(container);
-        let out_str = out.to_string_lossy().into_owned();
-        let args = [
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            link_str.as_str(),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c",
-            "copy",
-            "-movflags",
-            "faststart",
-            "-f",
-            container,
-            out_str.as_str(),
-        ];
-        match run_sidecar(app, "ffmpeg", &args) {
-            Ok((true, _, _)) if out.exists() => {
-                crate::log::log(&format!("[remux] {container} 流复制成功 -> {out_str}"));
-                return Ok(out);
-            }
-            Ok((_, _, err)) => {
-                crate::log::log(&format!("[remux] {container} 流复制失败: {err}"));
-                last_err = err;
-            }
-            Err(e) => {
-                crate::log::log(&format!("[remux] {container} 执行失败: {e}"));
-                last_err = e;
+    if !force_encode {
+        for container in ["mp4", "webm"] {
+            let out = dst.with_extension(container);
+            let out_str = out.to_string_lossy().into_owned();
+            let args = [
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                link_str.as_str(),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+                "-movflags",
+                "faststart",
+                "-f",
+                container,
+                out_str.as_str(),
+            ];
+            match run_sidecar(app, "ffmpeg", &args) {
+                Ok((true, _, _)) if out.exists() => {
+                    crate::log::log(&format!("[remux] {container} 流复制成功 -> {out_str}"));
+                    return Ok(out);
+                }
+                Ok((_, _, err)) => {
+                    crate::log::log(&format!("[remux] {container} 流复制失败: {err}"));
+                    last_err = err;
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[remux] {container} 执行失败: {e}"));
+                    last_err = e;
+                }
             }
         }
     }
 
-    // 2) 重编码回退：H.264+AAC 兼容性最好；本构建没带 libx264 时用内置的
-    //    MPEG-4 编码器兜底，保证这条路径一定能产出一个可播放的 MP4。
-    for vcodec in ["libx264", "mpeg4"] {
+    // 2) 重编码：H.264+AAC 兼容性最好；本构建没带 libx264 时，Windows 直接
+    //    报错（Chromium 不认 mpeg4），Linux 用内置 MPEG-4 编码器兜底。
+    #[cfg(target_os = "windows")]
+    let encoders: &[&str] = &["libx264"];
+    #[cfg(not(target_os = "windows"))]
+    let encoders: &[&str] = &["libx264", "mpeg4"];
+
+    for vcodec in encoders {
         let out = dst.with_extension("mp4");
         let out_str = out.to_string_lossy().into_owned();
         let args = [
