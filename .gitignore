@@ -11,6 +11,9 @@
 /out/
 /release/
 
+# FFmpeg sidecars — built locally by scripts/build-ffmpeg-*.sh, never committed
+/src-tauri/binaries/
+
 # Editor / OS
 .idea/
 .DS_Store

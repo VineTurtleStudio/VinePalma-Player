@@ -13,5 +13,5 @@
     "build:ffmpeg:windows": "bash scripts/build-ffmpeg-windows.sh"
   },
   "author": "VineTurtleStudio Dev <VineTurtleStudio@outlook.com>",
-  "license": "ISC"
+  "license": "MIT"
 }
