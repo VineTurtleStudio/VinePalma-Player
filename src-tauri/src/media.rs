@@ -20,21 +20,19 @@ use tauri::{AppHandle, Manager};
 /// Every container/codec a local player is likely to meet.
 pub const MEDIA_EXTS: &[&str] = &[
     // lossy & lossless audio
-    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape",
-    "aiff", "aif", "wv", "mpc", "tak", "tta", "alac", "amr", "au", "ac3",
-    "eac3", "dts", "dtshd", "dsf", "caf", "m4b", "mka",
-    // video containers
-    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "3gp", "3g2", "mpg",
-    "mpeg", "ts", "m2ts", "flv", "rm", "rmvb", "asf",
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape", "aiff", "aif", "wv",
+    "mpc", "tak", "tta", "alac", "amr", "au", "ac3", "eac3", "dts", "dtshd", "dsf", "caf", "m4b",
+    "mka", // video containers
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "3gp", "3g2", "mpg", "mpeg", "ts", "m2ts",
+    "flv", "rm", "rmvb", "asf",
 ];
 
 /// Extensions used in the native "open file" dialog filter.
 pub const DIALOG_EXTS: &[&str] = &[
-    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape",
-    "aiff", "aif", "wv", "mpc", "tak", "tta", "alac", "amr", "au", "ac3",
-    "eac3", "dts", "dsf", "caf", "m4b", "mka", "mp4", "m4v", "mkv", "webm",
-    "mov", "avi", "wmv", "3gp", "mpg", "mpeg", "ts", "m2ts", "flv", "rm",
-    "rmvb", "asf",
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "ape", "aiff", "aif", "wv",
+    "mpc", "tak", "tta", "alac", "amr", "au", "ac3", "eac3", "dts", "dsf", "caf", "m4b", "mka",
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "3gp", "mpg", "mpeg", "ts", "m2ts", "flv",
+    "rm", "rmvb", "asf",
 ];
 
 /// Containers the webview's `<video>` element can play natively (served as-is).
@@ -67,9 +65,9 @@ fn has_faststart(p: &Path) -> bool {
         }
     }
     match (moov, mdat) {
-        (Some(_), None) => true,       // index at the start, data stream beyond the scan window
-        (Some(m), Some(d)) => m < d,   // index before data -> faststart
-        _ => false,                    // no index visible (moov at end) -> not faststart
+        (Some(_), None) => true, // index at the start, data stream beyond the scan window
+        (Some(m), Some(d)) => m < d, // index before data -> faststart
+        _ => false,              // no index visible (moov at end) -> not faststart
     }
 }
 
@@ -78,9 +76,10 @@ fn has_faststart(p: &Path) -> bool {
 pub fn is_native_seekable(p: &Path) -> bool {
     match p.extension().and_then(|e| e.to_str()) {
         Some(e) if e.eq_ignore_ascii_case("webm") => true,
-        Some(e) if NATIVE_VIDEO_CONTAINERS
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(e)) =>
+        Some(e)
+            if NATIVE_VIDEO_CONTAINERS
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(e)) =>
         {
             has_faststart(p)
         }
@@ -103,16 +102,15 @@ pub fn is_native_seekable(p: &Path) -> bool {
 #[cfg(not(target_os = "windows"))]
 const NATIVE_AUDIO_EXTS: &[&str] = &[
     // lossy / container audio most players meet
-    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav",
-    "aiff", "aif", "caf", "ac3", "eac3", "alac", "mka",
+    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav", "aiff", "aif", "caf",
+    "ac3", "eac3", "alac", "mka",
 ];
 
 #[cfg(target_os = "windows")]
 const NATIVE_AUDIO_EXTS: &[&str] = &[
     // Chromium-native: MP3, AAC, Ogg/Opus, FLAC, WAV, ALAC-in-CAF/MP4.
     // aiff/aif, ac3, eac3, mka 不在此列 → 走 ffmpeg→WAV 回退。
-    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav",
-    "caf", "alac",
+    "mp3", "m4a", "aac", "m4b", "mp4", "ogg", "oga", "opus", "flac", "wav", "caf", "alac",
 ];
 
 pub fn is_native_audio(p: &Path) -> bool {
@@ -178,7 +176,7 @@ pub fn video_codec(app: &AppHandle, cache_dir: &Path, path: &Path) -> Option<Str
     let link = safe_link(cache_dir, path, "probe").ok()?;
     let s = link.to_str()?;
     let args = ["-v", "quiet", "-print_format", "json", "-show_streams", s];
-    let (ok, out, _) = run_sidecar(app, "ffprobe", &args).ok()?;
+    let (ok, out, _) = run_sidecar(app, "ffprobe", &args, PROBE_TIMEOUT_SECS).ok()?;
     if !ok {
         return None;
     }
@@ -205,18 +203,38 @@ pub struct TrackInfo {
     pub is_native_video: bool,
 }
 
+/// Sidecar timeouts per call site (seconds). A corrupt/truncated file can make
+/// ffmpeg hang forever; without a timeout that would freeze the whole
+/// playback path, so every spawn is bounded and killed on expiry.
+pub const PROBE_TIMEOUT_SECS: u64 = 30;
+pub const COVER_TIMEOUT_SECS: u64 = 60;
+pub const DECODE_TIMEOUT_SECS: u64 = 900;
+pub const REMUX_TIMEOUT_SECS: u64 = 3600;
+
 /// Run the bundled ffmpeg/ffprobe (shipped inside the app's resource dir, so a
 /// `.deb` install never touches `/usr/bin` and cannot fight the distro's own
 /// ffmpeg package) to completion and collect its output.
-fn run_sidecar(app: &AppHandle, bin: &str, args: &[&str]) -> Result<(bool, Vec<u8>, String), String> {
+///
+/// The child is killed when it exceeds `timeout_secs`; stdout/stderr are read
+/// on dedicated threads so a chatty process can never deadlock the pipe.
+fn run_sidecar(
+    app: &AppHandle,
+    bin: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<(bool, Vec<u8>, String), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     let path = app
         .path()
         .resource_dir()
         .map_err(|e| format!("获取资源目录失败: {e}"))?
         .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
 
-    let mut cmd = std::process::Command::new(&path);
-    cmd.args(args);
+    let mut cmd = Command::new(&path);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         // ffmpeg/ffprobe 是 console 子系统二进制，GUI 应用直接 spawn 会弹黑窗。
@@ -225,15 +243,51 @@ fn run_sidecar(app: &AppHandle, bin: &str, args: &[&str]) -> Result<(bool, Vec<u
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("执行 {bin} ({}) 失败: {e}", path.display()))?;
 
-    Ok((
-        output.status.success(),
-        output.stdout,
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    let stdout_pipe = child.stdout.take().expect("stdout 已设置为 piped");
+    let stderr_pipe = child.stderr.take().expect("stderr 已设置为 piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut pipe = stdout_pipe;
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut pipe = stderr_pipe;
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    crate::log::log(&format!(
+                        "[sidecar] {bin} 超过 {timeout_secs}s 未退出，已强制终止"
+                    ));
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("等待 {bin} 退出失败: {e}")),
+        }
+    };
+
+    let out = stdout_reader.join().unwrap_or_default();
+    let err = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+
+    match status {
+        Some(status) => Ok((status.success(), out, err)),
+        None => Err(format!("{bin} 执行超时（>{timeout_secs}s），已终止")),
+    }
 }
 
 /// Recursively collect every media file inside `dir`.
@@ -267,20 +321,17 @@ pub fn encode_key(path: &Path) -> String {
 }
 
 pub fn decode_key(key: &str) -> Option<PathBuf> {
-    URL_SAFE_NO_PAD
-        .decode(key)
-        .ok()
-        .and_then(|b| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStringExt;
-                Some(PathBuf::from(std::ffi::OsString::from_vec(b)))
-            }
-            #[cfg(not(unix))]
-            {
-                String::from_utf8(b).ok().map(PathBuf::from)
-            }
-        })
+    URL_SAFE_NO_PAD.decode(key).ok().and_then(|b| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            Some(PathBuf::from(std::ffi::OsString::from_vec(b)))
+        }
+        #[cfg(not(unix))]
+        {
+            String::from_utf8(b).ok().map(PathBuf::from)
+        }
+    })
 }
 
 /// A short (16 hex chars) stable hash of a path, used for cache *file names*.
@@ -298,30 +349,29 @@ pub fn short_key(path: &Path) -> String {
 
 /// Create a temporary ASCII-named handle pointing at `src`, so the ffmpeg
 /// sidecar can open files whose real name is not valid UTF-8.
-/// On Unix this is a symlink; on Windows a copy (Windows names are UTF-16, so
-/// the problematic case basically does not exist there).
-/// Returns the handle path (which lives inside `cache_dir`).
+/// On Unix this is a symlink; on Windows the original path is returned as-is
+/// (Windows file names are UTF-16 and pass through process arguments intact,
+/// so the mangled-name problem cannot happen there — and a full copy of the
+/// media file just to run ffprobe would be far too expensive).
+/// Returns the handle path (which lives inside `cache_dir` on Unix).
 fn safe_link(cache_dir: &Path, src: &Path, tag: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(cache_dir.join("src")).ok();
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let name = format!("{tag}-{}.{}", short_key(src), ext);
-    let link = cache_dir.join("src").join(&name);
-    if link.exists() {
-        return Ok(link);
+    #[cfg(windows)]
+    {
+        let _ = (cache_dir, tag);
+        Ok(src.to_path_buf())
     }
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(src, &link)
-            .map_err(|e| format!("无法创建符号链接: {e}"))?;
+        std::fs::create_dir_all(cache_dir.join("src")).ok();
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+        let name = format!("{tag}-{}.{}", short_key(src), ext);
+        let link = cache_dir.join("src").join(&name);
+        if link.exists() {
+            return Ok(link);
+        }
+        std::os::unix::fs::symlink(src, &link).map_err(|e| format!("无法创建符号链接: {e}"))?;
+        Ok(link)
     }
-    #[cfg(windows)]
-    {
-        std::fs::copy(src, &link).map_err(|e| format!("无法复制文件: {e}"))?;
-    }
-    Ok(link)
 }
 
 fn get_json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -341,7 +391,7 @@ fn track_info(app: &AppHandle, cache_dir: &Path, path: &Path) -> TrackInfo {
     let (mut title, mut artist, mut album) = (None, None, None);
     let mut has_video = false;
 
-    if let Some(link) = safe_link(cache_dir, path, "probe").ok() {
+    if let Ok(link) = safe_link(cache_dir, path, "probe") {
         if let Some(s) = link.to_str() {
             let args = [
                 "-v",
@@ -352,7 +402,7 @@ fn track_info(app: &AppHandle, cache_dir: &Path, path: &Path) -> TrackInfo {
                 "-show_streams",
                 s,
             ];
-            if let Ok((ok, out, _)) = run_sidecar(app, "ffprobe", &args) {
+            if let Ok((ok, out, _)) = run_sidecar(app, "ffprobe", &args, PROBE_TIMEOUT_SECS) {
                 if ok {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out) {
                         let format = &json["format"];
@@ -370,10 +420,7 @@ fn track_info(app: &AppHandle, cache_dir: &Path, path: &Path) -> TrackInfo {
                                 // An attached picture (embedded cover) is not a video
                                 // stream, so skip it when deciding video-ness.
                                 if ct == "video"
-                                    && s["disposition"]["attached_pic"]
-                                        .as_i64()
-                                        .unwrap_or(0)
-                                        != 1
+                                    && s["disposition"]["attached_pic"].as_i64().unwrap_or(0) != 1
                                 {
                                     has_video = true;
                                 }
@@ -421,7 +468,13 @@ pub fn probe_all(app: &AppHandle, cache_dir: &Path, paths: Vec<PathBuf>) -> Vec<
 
     let mut handles = Vec::new();
     for _ in 0..workers {
-        let (app, paths, cache, next, out) = (app.clone(), paths.clone(), cache.clone(), next.clone(), out.clone());
+        let (app, paths, cache, next, out) = (
+            app.clone(),
+            paths.clone(),
+            cache.clone(),
+            next.clone(),
+            out.clone(),
+        );
         handles.push(std::thread::spawn(move || loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n {
@@ -471,7 +524,7 @@ pub fn decode_to_wav(
         "wav",
         dst_str.as_str(),
     ];
-    let (ok, _, err) = run_sidecar(app, "ffmpeg", &args)?;
+    let (ok, _, err) = run_sidecar(app, "ffmpeg", &args, DECODE_TIMEOUT_SECS)?;
     if ok && dst.exists() {
         Ok(())
     } else {
@@ -508,7 +561,7 @@ pub fn extract_cover(
         "3",
         dst_str.as_str(),
     ];
-    let (ok, _, _) = run_sidecar(app, "ffmpeg", &args)?;
+    let (ok, _, _) = run_sidecar(app, "ffmpeg", &args, COVER_TIMEOUT_SECS)?;
     Ok(ok && dst.exists())
 }
 
@@ -563,7 +616,7 @@ pub fn remux_video(
                 container,
                 out_str.as_str(),
             ];
-            match run_sidecar(app, "ffmpeg", &args) {
+            match run_sidecar(app, "ffmpeg", &args, REMUX_TIMEOUT_SECS) {
                 Ok((true, _, _)) if out.exists() => {
                     crate::log::log(&format!("[remux] {container} 流复制成功 -> {out_str}"));
                     return Ok(out);
@@ -616,7 +669,7 @@ pub fn remux_video(
             "mp4",
             out_str.as_str(),
         ];
-        match run_sidecar(app, "ffmpeg", &args) {
+        match run_sidecar(app, "ffmpeg", &args, REMUX_TIMEOUT_SECS) {
             Ok((true, _, _)) if out.exists() => {
                 crate::log::log(&format!("[remux] mp4 重编码({vcodec})成功 -> {out_str}"));
                 return Ok(out);

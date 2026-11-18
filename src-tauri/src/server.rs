@@ -18,10 +18,30 @@ use tauri::AppHandle;
 pub struct StreamState {
     app: AppHandle,
     pub port: u16,
+    /// Per-launch random token required on every request. The server binds
+    /// 127.0.0.1 but any local process could still connect to a bare port;
+    /// the token makes the URLs unguessable so other processes cannot read
+    /// arbitrary media files off this server.
+    token: String,
     cache_dir: PathBuf,
+    /// Serializes decode/remux work: rapid track switching must not start the
+    /// same conversion twice, and a folder of exotic files must not run N
+    /// ffmpeg processes at once and thrash the CPU.
+    busy: Mutex<()>,
     decodes: Mutex<HashMap<String, PathBuf>>,
     covers: Mutex<HashMap<String, Option<PathBuf>>>,
     videos: Mutex<HashMap<String, PathBuf>>,
+}
+
+/// Generate a 128-bit random hex token. `RandomState` is seeded per-instance
+/// from OS entropy, so two freshly created hashers give plenty of randomness
+/// without adding a dependency.
+fn generate_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let a = RandomState::new().build_hasher().finish();
+    let b = RandomState::new().build_hasher().finish();
+    format!("{a:016x}{b:016x}")
 }
 
 impl StreamState {
@@ -33,7 +53,9 @@ impl StreamState {
         let state = Arc::new(StreamState {
             app,
             port,
+            token: generate_token(),
             cache_dir,
+            busy: Mutex::new(()),
             decodes: Mutex::new(HashMap::new()),
             covers: Mutex::new(HashMap::new()),
             videos: Mutex::new(HashMap::new()),
@@ -55,20 +77,40 @@ impl StreamState {
     }
 
     pub fn play_url(&self, path: &std::path::Path) -> String {
-        format!("{}/play?p={}", self.base_url(), media::encode_key(path))
+        format!(
+            "{}/play?p={}&t={}",
+            self.base_url(),
+            media::encode_key(path),
+            self.token
+        )
     }
 
     pub fn video_url(&self, path: &std::path::Path) -> String {
-        format!("{}/video?p={}", self.base_url(), media::encode_key(path))
+        format!(
+            "{}/video?p={}&t={}",
+            self.base_url(),
+            media::encode_key(path),
+            self.token
+        )
     }
 
     pub fn cover_url(&self, path: &std::path::Path) -> String {
-        format!("{}/cover?p={}", self.base_url(), media::encode_key(path))
+        format!(
+            "{}/cover?p={}&t={}",
+            self.base_url(),
+            media::encode_key(path),
+            self.token
+        )
     }
 
     /// Decode a file to a cached WAV (idempotent).
+    ///
+    /// The `busy` gate is held for the whole conversion: concurrent callers
+    /// queue up, and after acquiring the gate the cache is re-checked so the
+    /// same file is only ever decoded once (rapid next/prev switching).
     pub fn ensure_decoded(&self, path: &std::path::Path) -> Result<PathBuf, String> {
         let key = media::short_key(path);
+        let _gate = self.busy.lock().unwrap();
         if let Some(p) = self.decodes.lock().unwrap().get(&key) {
             return Ok(p.clone());
         }
@@ -82,8 +124,11 @@ impl StreamState {
     /// when its container is already browser-native *and* seekable (faststart)
     /// *and* the codec is decodable by this platform's webview; otherwise
     /// remuxes/re-encodes a copy so playback works and the index sits at front.
+    /// Shares the same `busy` gate as audio decoding, so a remux and a decode
+    /// never run in parallel.
     pub fn ensure_video(&self, path: &std::path::Path) -> Result<PathBuf, String> {
         let key = media::short_key(path);
+        let _gate = self.busy.lock().unwrap();
         if let Some(p) = self.videos.lock().unwrap().get(&key) {
             return Ok(p.clone());
         }
@@ -165,6 +210,21 @@ fn handle(request: Request, state: Arc<StreamState>) {
         None => (url.trim_start_matches('/'), ""),
     };
 
+    // 每次启动随机的访问 token：URL 由 Rust 端拼接下发，外部进程猜不到，
+    // 无法通过这个回环端口读取任意媒体文件。
+    let token_ok = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("t="))
+        .is_some_and(|t| t == state.token);
+    if !token_ok {
+        crate::log::log(&format!(
+            "HTTP {} 拒绝（token 不匹配）",
+            url.split('?').next().unwrap_or("")
+        ));
+        let _ = request.respond(empty_resp(404));
+        return;
+    }
+
     let range = get_header(&request, "Range");
     let key = query
         .split('&')
@@ -214,11 +274,8 @@ fn serve_file(
             None => {
                 let headers = vec![
                     Header::from_bytes("Accept-Ranges", "bytes").ok()?,
-                    Header::from_bytes(
-                        "Content-Range",
-                        format!("bytes */{size}").as_bytes(),
-                    )
-                    .ok()?,
+                    Header::from_bytes("Content-Range", format!("bytes */{size}").as_bytes())
+                        .ok()?,
                 ];
                 let reader: Body = Box::new(empty());
                 return Some(Response::new(
@@ -234,25 +291,27 @@ fn serve_file(
         (StatusCode(200), 0, size)
     };
 
-
-    crate::log::log(&format!("serve_file: status={}, start={}, len={}, size={}", status.0, start, len, size)); // 新增
-// ... 构造 headers，并打印 Content-Range
+    crate::log::log(&format!(
+        "serve_file: status={}, start={}, len={}, size={}",
+        status.0, start, len, size
+    )); // 新增
+        // ... 构造 headers，并打印 Content-Range
     let cr = format!("bytes {}-{}/{}", start, start + len - 1, size);
     crate::log::log(&format!("serve_file: Content-Range = {}", cr)); // 新增
-let mut headers = vec![
-    Header::from_bytes("Content-Type", content_type).ok()?,
-    Header::from_bytes("Accept-Ranges", "bytes").ok()?,
-    Header::from_bytes("Cache-Control", "no-store").ok()?,
-    Header::from_bytes("Access-Control-Allow-Origin", "*").ok()?,
-];
-// 总是添加 Content-Length
-headers.push(Header::from_bytes("Content-Length", len.to_string().as_bytes()).ok()?);
+    let mut headers = vec![
+        Header::from_bytes("Content-Type", content_type).ok()?,
+        Header::from_bytes("Accept-Ranges", "bytes").ok()?,
+        Header::from_bytes("Cache-Control", "no-store").ok()?,
+        Header::from_bytes("Access-Control-Allow-Origin", "*").ok()?,
+    ];
+    // 总是添加 Content-Length
+    headers.push(Header::from_bytes("Content-Length", len.to_string().as_bytes()).ok()?);
 
-// 仅在 206 时添加 Content-Range
-if status.0 == 206 {
-    let cr = format!("bytes {}-{}/{}", start, start + len - 1, size);
-    headers.push(Header::from_bytes("Content-Range", cr.as_bytes()).ok()?);
-}
+    // 仅在 206 时添加 Content-Range
+    if status.0 == 206 {
+        let cr = format!("bytes {}-{}/{}", start, start + len - 1, size);
+        headers.push(Header::from_bytes("Content-Range", cr.as_bytes()).ok()?);
+    }
 
     let reader: Body = if head_only {
         Box::new(empty())
@@ -324,14 +383,8 @@ fn handle_cover(state: &StreamState, key: &str, head_only: bool) -> Option<Respo
     };
 
     Some(
-        Response::new(
-            StatusCode(200),
-            headers,
-            reader,
-            Some(len as usize),
-            None,
-        )
-        .with_chunked_threshold(usize::MAX),
+        Response::new(StatusCode(200), headers, reader, Some(len as usize), None)
+            .with_chunked_threshold(usize::MAX),
     )
 }
 
@@ -372,7 +425,7 @@ mod tests {
     /// bytes a browser / GStreamer would receive can be asserted.
     fn render(resp: Response<Body>, head_only: bool) -> Vec<u8> {
         let mut buf = Vec::new();
-        let v = HTTPVersion::try_from((1, 1)).unwrap();
+        let v = HTTPVersion::from((1, 1));
         resp.raw_print(&mut buf, v, &[], head_only, None).unwrap();
         buf
     }
@@ -399,11 +452,20 @@ mod tests {
         let bytes: Vec<u8> = (0..N as u32).map(|i| (i % 251) as u8).collect();
         let f = write_tmp("vp_rng_slice.bin", &bytes);
 
-        let resp = serve_file(&f, "application/octet-stream", Some("bytes=100-199".into()), false).unwrap();
+        let resp = serve_file(
+            &f,
+            "application/octet-stream",
+            Some("bytes=100-199".into()),
+            false,
+        )
+        .unwrap();
         assert_eq!(resp.status_code().0, 206);
         let out = render(resp, false);
         let head = String::from_utf8_lossy(&out);
-        assert!(head.contains("Content-Range: bytes 100-199/1000"), "headers: {head}");
+        assert!(
+            head.contains("Content-Range: bytes 100-199/1000"),
+            "headers: {head}"
+        );
         assert!(head.contains("Content-Length: 100"), "headers: {head}");
         assert_eq!(&out[out.len() - 100..], &bytes[100..200]);
     }
@@ -414,19 +476,37 @@ mod tests {
         let f = write_tmp("vp_rng_suffix.bin", &bytes);
 
         // bytes=500-  => from offset 500 to end
-        let resp = serve_file(&f, "application/octet-stream", Some("bytes=500-".into()), false).unwrap();
+        let resp = serve_file(
+            &f,
+            "application/octet-stream",
+            Some("bytes=500-".into()),
+            false,
+        )
+        .unwrap();
         assert_eq!(resp.status_code().0, 206);
         let out = render(resp, false);
         let head = String::from_utf8_lossy(&out);
-        assert!(head.contains("Content-Range: bytes 500-999/1000"), "headers: {head}");
+        assert!(
+            head.contains("Content-Range: bytes 500-999/1000"),
+            "headers: {head}"
+        );
         assert_eq!(&out[out.len() - 500..], &bytes[500..]);
 
         // bytes=-100 => the last 100 bytes
-        let resp = serve_file(&f, "application/octet-stream", Some("bytes=-100".into()), false).unwrap();
+        let resp = serve_file(
+            &f,
+            "application/octet-stream",
+            Some("bytes=-100".into()),
+            false,
+        )
+        .unwrap();
         assert_eq!(resp.status_code().0, 206);
         let out = render(resp, false);
         let head = String::from_utf8_lossy(&out);
-        assert!(head.contains("Content-Range: bytes 900-999/1000"), "headers: {head}");
+        assert!(
+            head.contains("Content-Range: bytes 900-999/1000"),
+            "headers: {head}"
+        );
         assert_eq!(&out[out.len() - 100..], &bytes[900..]);
     }
 
@@ -451,11 +531,19 @@ mod tests {
         let f = write_tmp("vp_rng_invalid.bin", &bytes);
 
         for bad in ["bytes=2000-3000", "garbage", "bytes=abc-def", "bytes=5-2"] {
-            let resp = serve_file(&f, "application/octet-stream", Some(bad.to_string()), false).unwrap();
-            assert_eq!(resp.status_code().0, 416, "range {bad:?} should be rejected -> 416");
+            let resp =
+                serve_file(&f, "application/octet-stream", Some(bad.to_string()), false).unwrap();
+            assert_eq!(
+                resp.status_code().0,
+                416,
+                "range {bad:?} should be rejected -> 416"
+            );
             let out = render(resp, false);
             let head = String::from_utf8_lossy(&out);
-            assert!(head.contains("Content-Range: bytes */1000"), "headers: {head}");
+            assert!(
+                head.contains("Content-Range: bytes */1000"),
+                "headers: {head}"
+            );
         }
     }
 

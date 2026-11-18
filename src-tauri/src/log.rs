@@ -13,6 +13,8 @@ use tauri::{AppHandle, Manager};
 static STATE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// (Re)create the log file in the app cache dir. Call once at startup.
+/// The previous run's log is kept as `player.log.1` (one generation) so a
+/// crash can still be diagnosed from the launch before the frozen one.
 pub fn init(app: &AppHandle) {
     let path = app
         .path()
@@ -22,7 +24,11 @@ pub fn init(app: &AppHandle) {
             dir.join("player.log")
         })
         .unwrap_or_default();
-    let _ = std::fs::remove_file(&path);
+    if path.exists() {
+        let old = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
     *STATE.lock().unwrap() = Some(path);
     log("=== VinePalma Player 启动 ===");
 }

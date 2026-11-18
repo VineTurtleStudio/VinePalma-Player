@@ -25,7 +25,6 @@ impl AppState {
     }
 }
 
-
 fn clean_cache(cache_dir: &std::path::Path) {
     const MAX_AGE_DAYS: u64 = 7;
     const MAX_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2GB
@@ -33,12 +32,16 @@ fn clean_cache(cache_dir: &std::path::Path) {
     let now = std::time::SystemTime::now();
     let max_age = std::time::Duration::from_secs(MAX_AGE_DAYS * 24 * 3600);
 
+    // 缓存根目录与一层子目录（如 Unix 上的 src/ 符号链接目录）都纳入清理范围。
     let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(cache_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(meta) = path.metadata() {
+    let mut dirs = vec![cache_dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if let Ok(meta) = path.metadata() {
                     if let Ok(modified) = meta.modified() {
                         files.push((path, modified));
                     }
@@ -67,10 +70,7 @@ fn clean_cache(cache_dir: &std::path::Path) {
     }
 
     if total_size > MAX_SIZE_BYTES {
-        let mut remaining_files: Vec<_> = files
-            .into_iter()
-            .filter(|(p, _)| p.exists())
-            .collect();
+        let mut remaining_files: Vec<_> = files.into_iter().filter(|(p, _)| p.exists()).collect();
         remaining_files.sort_by_key(|(_, t)| *t);
         for (path, _) in remaining_files {
             if total_size <= MAX_SIZE_BYTES {
@@ -84,10 +84,6 @@ fn clean_cache(cache_dir: &std::path::Path) {
     }
 }
 
-
-
-
-
 /// Pick one media file and return its metadata.
 #[tauri::command]
 async fn open_file(app: AppHandle) -> Result<Option<media::TrackInfo>, String> {
@@ -95,7 +91,7 @@ async fn open_file(app: AppHandle) -> Result<Option<media::TrackInfo>, String> {
     let dialog = app
         .dialog()
         .file()
-        .set_title("选择音乐文件")
+        .set_title("选择媒体文件")
         .add_filter("媒体文件", media::DIALOG_EXTS)
         .add_filter("所有文件", &["*"]);
     dialog.pick_file(move |f| {
@@ -112,7 +108,9 @@ async fn open_file(app: AppHandle) -> Result<Option<media::TrackInfo>, String> {
     let path = fp.into_path().map_err(|e| e.to_string())?;
 
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
-    Ok(media::probe_all(&app, &cache_dir, vec![path]).into_iter().next())
+    Ok(media::probe_all(&app, &cache_dir, vec![path])
+        .into_iter()
+        .next())
 }
 
 /// Scan a folder (recursively) and return metadata for every media file.
@@ -174,15 +172,14 @@ async fn video_url(
     let src = media::decode_key(&path).ok_or("无效的文件路径")?;
     let stream = state.stream.clone();
     let src_for_task = src.clone();
-    let resolved =
-        tauri::async_runtime::spawn_blocking(move || stream.ensure_video(&src_for_task))
-            .await
-            .map_err(|e| e.to_string())??;
+    let resolved = tauri::async_runtime::spawn_blocking(move || stream.ensure_video(&src_for_task))
+        .await
+        .map_err(|e| e.to_string())??;
     // 🟢 默认返回 HTTP 环回地址（支持 Range），除非显式请求 asset
     let url = if mode.as_deref() == Some("asset") {
         resolved.to_string_lossy().into_owned()
     } else {
-        state.stream.video_url(&src)   // http://127.0.0.1:port/video?p=...
+        state.stream.video_url(&src) // http://127.0.0.1:port/video?p=...
     };
     Ok(url)
 }
@@ -271,22 +268,22 @@ fn open_mini(app: AppHandle) -> Result<bool, String> {
         return Ok(true);
     }
     let (x, y) = bottom_right(&app, 340.0, 64.0);
-    let window = tauri::WebviewWindowBuilder::new(
-        &app,
-        "mini",
-        tauri::WebviewUrl::App("mini.html".into()),
-    )
-    .title("VinePalma 迷你播放器")
-    .inner_size(340.0, 64.0)
-    .position(x, y)
-    .resizable(false)
-    .decorations(false)
-    .transparent(true)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .shadow(false)
-    .build()
-    .map_err(|e| e.to_string())?;
+    let window =
+        tauri::WebviewWindowBuilder::new(&app, "mini", tauri::WebviewUrl::App("mini.html".into()))
+            .title("VinePalma 迷你播放器")
+            .inner_size(340.0, 64.0)
+            .position(x, y)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .shadow(false)
+            .build()
+            .map_err(|e| e.to_string())?;
+    // 非 Linux 平台不需要取窗口句柄做 GTK 修复，显式消费避免 unused 警告。
+    #[cfg(not(target_os = "linux"))]
+    let _ = &window;
     // WebKitGTK 会给 WebView 窗口强加约 200px 的最小高度（gtk_window_resize
     // 默认受子控件自然尺寸约束），导致 64px 的小卡片实际被撑高。对 GTK 窗口
     // 本身设置 size request 可覆盖该下限，从而真正得到 340x64。
@@ -361,16 +358,11 @@ fn store_get(state: State<'_, AppState>, key: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn store_set(
-    state: State<'_, AppState>,
-    key: String,
-    value: Value,
-) -> Result<(), String> {
+fn store_set(state: State<'_, AppState>, key: String, value: Value) -> Result<(), String> {
     state.settings.lock().unwrap().insert(key, value);
     state.save_settings();
     Ok(())
 }
-
 
 /// 修复 Linux 透明窗口“整个窗口鼠标穿透、无法点击”的问题。
 ///
@@ -385,7 +377,9 @@ fn fix_transparent_click_through(app: &tauri::AppHandle, label: &str) {
     use gtk::prelude::*;
     use tauri::Manager;
 
-    let Some(w) = app.get_webview_window(label) else { return };
+    let Some(w) = app.get_webview_window(label) else {
+        return;
+    };
     let Ok(gtk_win) = w.gtk_window() else { return };
 
     fn reset_input_region(win: &gtk::Window) {
@@ -411,7 +405,6 @@ fn fix_transparent_click_through(app: &tauri::AppHandle, label: &str) {
     }
     gtk_win.connect_map(|win| reset_input_region(&win.clone().upcast::<gtk::Window>()));
 }
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
