@@ -565,6 +565,118 @@ pub fn extract_cover(
     Ok(ok && dst.exists())
 }
 
+// ---------------------------------------------------------------------------
+// 字幕：列出可渲染的文本字幕轨，并按需提取为 WebVTT 供 <track> 播放。
+// 位图字幕（pgssub/dvd_subtitle/dvb_subtitle）无法转成 VTT 文本，不列出。
+// ---------------------------------------------------------------------------
+
+pub const SUBTITLE_TIMEOUT_SECS: u64 = 120;
+
+/// ffmpeg 能转成 WebVTT 的文本字幕编码。
+const TEXT_SUBTITLE_CODECS: &[&str] = &["subrip", "srt", "ass", "ssa", "mov_text", "webvtt"];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubtitleInfo {
+    /// 相对字幕轨序号（`ffmpeg -map 0:s:<track>` 用）。注意它按所有字幕轨
+    /// （含位图轨）计数，与 ffprobe 的绝对 stream index 不同。
+    pub track: u32,
+    /// ffprobe 的绝对 stream index（仅信息展示用）。
+    pub stream_index: u32,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+}
+
+/// 缓存文件名：`<short_key>-sub<track>.vtt`（命令生成与服务端读取共用）。
+pub fn subtitle_cache_name(path: &Path, track: u32) -> String {
+    format!("{}-sub{track}.vtt", short_key(path))
+}
+
+/// 列出 `path` 中可渲染的文本字幕轨（无可渲染字幕时返回空）。
+pub fn list_subtitles(app: &AppHandle, cache_dir: &Path, path: &Path) -> Vec<SubtitleInfo> {
+    let Ok(link) = safe_link(cache_dir, path, "probe") else {
+        return Vec::new();
+    };
+    let Some(s) = link.to_str() else {
+        return Vec::new();
+    };
+    let args = ["-v", "quiet", "-print_format", "json", "-show_streams", s];
+    let Ok((ok, out, _)) = run_sidecar(app, "ffprobe", &args, PROBE_TIMEOUT_SECS) else {
+        return Vec::new();
+    };
+    if !ok {
+        return Vec::new();
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out) else {
+        return Vec::new();
+    };
+    let Some(streams) = json["streams"].as_array() else {
+        return Vec::new();
+    };
+
+    let mut subs = Vec::new();
+    let mut rel = 0u32;
+    for st in streams {
+        if st["codec_type"].as_str() != Some("subtitle") {
+            continue;
+        }
+        let codec = st["codec_name"].as_str().unwrap_or("").to_string();
+        let is_text = TEXT_SUBTITLE_CODECS
+            .iter()
+            .any(|c| codec.eq_ignore_ascii_case(c));
+        let info = SubtitleInfo {
+            track: rel,
+            stream_index: st["index"].as_u64().unwrap_or(0) as u32,
+            codec,
+            language: st["tags"]["language"].as_str().map(String::from),
+            title: get_json_str(&st["tags"], &["title"]),
+        };
+        rel += 1;
+        if is_text {
+            subs.push(info);
+        }
+    }
+    subs
+}
+
+/// Extract subtitle stream `track`（相对序号）of `src` into a WebVTT file at
+/// `dst`. Returns `Ok(true)` when a VTT with actual cues was produced and
+/// `Ok(false)` when the track exists but has no dialogue (header-only output).
+pub fn extract_subtitle(
+    app: &AppHandle,
+    cache_dir: &Path,
+    src: &Path,
+    dst: &Path,
+    track: u32,
+) -> Result<bool, String> {
+    let link = safe_link(cache_dir, src, "sub")?;
+    let link_str = link.to_string_lossy().into_owned();
+    let dst_str = dst.to_string_lossy().into_owned();
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        link_str.as_str(),
+        "-map",
+        &format!("0:s:{track}"),
+        "-f",
+        "webvtt",
+        dst_str.as_str(),
+    ];
+    let (ok, _, err) = run_sidecar(app, "ffmpeg", &args, SUBTITLE_TIMEOUT_SECS)?;
+    if !ok {
+        return Err(format!("字幕提取失败: {err}"));
+    }
+    // 只剩 "WEBVTT" 头的输出说明该轨没有可显示的对白。
+    let non_empty = std::fs::metadata(dst)
+        .map(|m| m.len() > 16)
+        .unwrap_or(false);
+    Ok(non_empty)
+}
+
 /// Remux `src` into a browser-friendly container.
 ///
 /// Layered strategy, fastest to slowest:

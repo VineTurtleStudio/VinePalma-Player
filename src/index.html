@@ -37,10 +37,11 @@
         <!-- 视频播放区（仅视频文件时显示，自动按比例放大填满中间区域） -->
         <div class="video-wrap" id="video-wrap">
             <video id="video-player" playsinline preload="auto"></video>
-            <!-- 悬停浮层：播放/暂停 + 内容全屏 -->
+            <!-- 悬停浮层：播放/暂停 + 字幕 + 内容全屏 -->
             <div class="video-overlay" id="video-overlay">
                 <button id="video-play" class="video-btn video-primary" title="播放/暂停">⏸</button>
                 <div class="video-overlay-spacer"></div>
+                <button id="video-subtitle" class="video-btn" title="字幕" style="display:none;">CC</button>
                 <button id="video-fullscreen" class="video-btn" title="内容全屏">⛶</button>
             </div>
             <!-- PotPlayer 风格底部进度条（视频播放时始终可用） -->

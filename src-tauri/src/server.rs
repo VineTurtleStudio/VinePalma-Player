@@ -103,6 +103,15 @@ impl StreamState {
         )
     }
 
+    pub fn subtitle_url(&self, path: &std::path::Path, track: u32) -> String {
+        format!(
+            "{}/subtitle?p={}&i={track}&t={}",
+            self.base_url(),
+            media::encode_key(path),
+            self.token
+        )
+    }
+
     /// Decode a file to a cached WAV (idempotent).
     ///
     /// The `busy` gate is held for the whole conversion: concurrent callers
@@ -160,6 +169,32 @@ impl StreamState {
 
         self.videos.lock().unwrap().insert(key, resolved.clone());
         Ok(resolved)
+    }
+
+    /// Extract (or reuse) a WebVTT copy of subtitle track `track`. Shares the
+    /// `busy` gate with decoding/remuxing so a slow extraction never races a
+    /// playback conversion.
+    pub fn ensure_subtitle(&self, path: &std::path::Path, track: u32) -> Result<PathBuf, String> {
+        let dst = self.cache_dir.join(media::subtitle_cache_name(path, track));
+        if dst.exists() {
+            return Ok(dst);
+        }
+        let _gate = self.busy.lock().unwrap();
+        if dst.exists() {
+            return Ok(dst);
+        }
+        match media::extract_subtitle(&self.app, &self.cache_dir, path, &dst, track) {
+            Ok(true) => Ok(dst),
+            Ok(false) => {
+                // 空轨（只有 WEBVTT 头）：删除残留文件并明确报错
+                let _ = std::fs::remove_file(&dst);
+                Err("该字幕轨没有可显示的对白".into())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dst);
+                Err(e)
+            }
+        }
     }
 
     /// Lazily extract and cache the cover art for a single file. Negative
@@ -235,6 +270,7 @@ fn handle(request: Request, state: Arc<StreamState>) {
         ("play", Some(key)) => handle_play(&state, &key, range.clone(), head_only),
         ("video", Some(key)) => handle_video(&state, &key, range.clone(), head_only),
         ("cover", Some(key)) => handle_cover(&state, &key, head_only),
+        ("subtitle", Some(key)) => handle_subtitle(&state, &key, query, head_only),
         _ => Some(empty_resp(404)),
     };
 
@@ -386,6 +422,30 @@ fn handle_cover(state: &StreamState, key: &str, head_only: bool) -> Option<Respo
         Response::new(StatusCode(200), headers, reader, Some(len as usize), None)
             .with_chunked_threshold(usize::MAX),
     )
+}
+
+/// Serve a cached WebVTT subtitle file. The extraction itself normally happens
+/// up-front through the `subtitle_url` command; if the file is missing (cache
+/// cleaned mid-session) it is regenerated here on demand.
+fn handle_subtitle(
+    state: &StreamState,
+    key: &str,
+    query: &str,
+    head_only: bool,
+) -> Option<Response<Body>> {
+    let src = media::decode_key(key)?;
+    let track = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("i="))
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let vtt = state
+        .cache_dir
+        .join(media::subtitle_cache_name(&src, track));
+    if !vtt.exists() {
+        state.ensure_subtitle(&src, track).ok()?;
+    }
+    serve_file(&vtt, "text/vtt", None, head_only)
 }
 
 /// Parse a `Range: bytes=...` header into an inclusive byte range.

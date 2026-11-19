@@ -143,8 +143,9 @@ run_configure() {
     --enable-decoder=mp3,mp1,mp2,aac,aac_latm,flac,vorbis,opus,ac3,eac3,dca,alac,ape,wavpack,wmav1,wmav2,wmapro,wmalossless,wmavoice,amrnb,amrwb,cook,tak,tta,truehd,mpc7,mpc8,atrac3,gsm,gsm_ms,als,shorten,binkaudio_dct,binkaudio_rdft,qdm2,real_144 \
     --enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le,pcm_u8,pcm_u16le,pcm_u24le,pcm_u32le,pcm_alaw,pcm_mulaw,pcm_s16le_planar,pcm_s24le_planar,pcm_s32le_planar,pcm_f32le_planar,pcm_f64le_planar \
     --enable-decoder=h264,hevc,vp8,vp9,mpeg4,mjpeg,png,bmp \
-    --enable-encoder=pcm_s16le,mjpeg,aac,mpeg4 \
-    --enable-muxer=wav,image2,mp4,mov,webm,matroska,mpegts,adts,mp3,ogg \
+    --enable-decoder=srt,ass,movtext,webvtt \
+    --enable-encoder=pcm_s16le,mjpeg,aac,mpeg4,webvtt \
+    --enable-muxer=wav,image2,mp4,mov,webm,matroska,mpegts,adts,mp3,ogg,webvtt \
     --extra-cflags="${EXTRA_CFLAGS[*]}" \
     --extra-ldflags="${EXTRA_LDFLAGS[*]}" \
     --extra-libs="${EXTRA_LIBS[*]}"

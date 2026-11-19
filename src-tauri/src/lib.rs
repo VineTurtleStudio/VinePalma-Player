@@ -221,6 +221,33 @@ async fn get_cover(state: State<'_, AppState>, path: String) -> Result<Option<St
     Ok(has.map(|_| state.stream.cover_url(&src)))
 }
 
+/// List the renderable (text-based) subtitle tracks of a video file.
+#[tauri::command]
+async fn list_subtitles(app: AppHandle, path: String) -> Result<Vec<media::SubtitleInfo>, String> {
+    let src = media::decode_key(&path).ok_or("无效的文件路径")?;
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || media::list_subtitles(&app, &cache_dir, &src))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Extract (or reuse) a WebVTT copy of subtitle track `track` and return the
+/// URL the frontend can hand to a `<track kind="subtitles">` element.
+#[tauri::command]
+async fn subtitle_url(
+    state: State<'_, AppState>,
+    path: String,
+    track: u32,
+) -> Result<String, String> {
+    let src = media::decode_key(&path).ok_or("无效的文件路径")?;
+    let stream = state.stream.clone();
+    let src_for_task = src.clone();
+    tauri::async_runtime::spawn_blocking(move || stream.ensure_subtitle(&src_for_task, track))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(state.stream.subtitle_url(&src, track))
+}
+
 /// Open the settings window (created here so it never depends on the webview's
 /// ability to create windows from JavaScript). Calling this again while the
 /// window is already open closes it, so the header button toggles the page.
@@ -517,6 +544,8 @@ pub fn run() {
             stream_url,
             video_url,
             get_cover,
+            list_subtitles,
+            subtitle_url,
             open_settings,
             open_mini,
             close_mini,

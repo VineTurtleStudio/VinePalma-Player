@@ -46,10 +46,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // ---- 视频浮层控件 ----
     const videoPlayBtn = document.getElementById('video-play');
     const videoFullscreenBtn = document.getElementById('video-fullscreen');
+    const videoSubtitleBtn = document.getElementById('video-subtitle');
     const videoProgressBar = document.getElementById('video-progress');
     const videoCurrentEl = document.getElementById('video-current');
     const videoTotalEl = document.getElementById('video-total');
     const seekTooltip = document.getElementById('seek-tooltip');
+
+    // ---- 字幕轨道状态（-1 表示关闭） ----
+    let subtitleTracks = [];
+    let subtitleCurrent = -1;
 
     // ---- Tauri API ----
     const tauri = window.__TAURI__;
@@ -337,9 +342,20 @@ document.addEventListener('DOMContentLoaded', () => {
         try { other.pause(); other.removeAttribute('src'); other.load(); } catch (e) {}
 
         try {
-            const url = isVideo
-                ? await invoke('video_url', { path: item.path, mode: 'http' })
-                : await invoke('stream_url', { path: item.path });
+            // 视频：并行取流地址与字幕轨列表；<track> 必须在设置 src 之前插入，
+            // 动态增删 <track> 会触发媒体元素重载
+            let url;
+            if (isVideo) {
+                const [u, subs] = await Promise.all([
+                    invoke('video_url', { path: item.path, mode: 'http' }),
+                    invoke('list_subtitles', { path: item.path }).catch(() => []),
+                ]);
+                url = u;
+                rebuildSubtitleTracks(subs || []);
+            } else {
+                url = await invoke('stream_url', { path: item.path });
+                if (videoSubtitleBtn) videoSubtitleBtn.style.display = 'none';
+            }
 
             const media = isVideo ? videoPlayer : audioPlayer;
             media.src = url;
@@ -865,6 +881,68 @@ document.addEventListener('DOMContentLoaded', () => {
         videoFullscreenBtn.addEventListener('click', () => {
             toggleContentFullscreen();
         });
+    }
+
+    // ---- 字幕：重建轨道列表 + CC 按钮循环切换 ----
+    // <track> 的 src 延迟到真正选用时才生成，避免每次播放都提取所有字幕轨
+    function rebuildSubtitleTracks(subs) {
+        subtitleTracks = subs || [];
+        subtitleCurrent = -1;
+        for (const el of Array.from(videoPlayer.querySelectorAll('track'))) {
+            el.remove();
+        }
+        if (videoSubtitleBtn) {
+            videoSubtitleBtn.style.display = subtitleTracks.length ? '' : 'none';
+            videoSubtitleBtn.classList.remove('active');
+            videoSubtitleBtn.textContent = 'CC';
+        }
+        subtitleTracks.forEach((st, i) => {
+            const el = document.createElement('track');
+            el.kind = 'subtitles';
+            el.label = st.title || (st.language ? st.language.toUpperCase() : `字幕 ${i + 1}`);
+            el.srclang = st.language || '';
+            videoPlayer.appendChild(el);
+        });
+    }
+
+    async function cycleSubtitle() {
+        const n = subtitleTracks.length;
+        if (!n) return;
+        const tracks = videoPlayer.textTracks;
+        if (subtitleCurrent >= 0 && tracks[subtitleCurrent]) {
+            tracks[subtitleCurrent].mode = 'disabled';
+        }
+        subtitleCurrent += 1;
+        if (subtitleCurrent >= n) {
+            subtitleCurrent = -1;
+            if (videoSubtitleBtn) {
+                videoSubtitleBtn.classList.remove('active');
+                videoSubtitleBtn.textContent = 'CC';
+            }
+            setStatus('CC 字幕已关闭', 'info');
+            return;
+        }
+        const st = subtitleTracks[subtitleCurrent];
+        const el = videoPlayer.querySelectorAll('track')[subtitleCurrent];
+        try {
+            if (el && !el.src) {
+                const item = playlist[currentIndex];
+                const url = await invoke('subtitle_url', { path: item.path, track: st.track });
+                el.src = url;
+            }
+            if (tracks[subtitleCurrent]) tracks[subtitleCurrent].mode = 'showing';
+            if (videoSubtitleBtn) {
+                videoSubtitleBtn.classList.add('active');
+                videoSubtitleBtn.textContent = `CC${subtitleCurrent + 1}`;
+            }
+            setStatus(`CC 字幕: ${el?.label || st.language || '轨 ' + (subtitleCurrent + 1)}`, 'info');
+        } catch (e) {
+            subtitleCurrent = -1;
+            setStatus('❌ 字幕提取失败: ' + (e && e.message ? e.message : e), 'error');
+        }
+    }
+    if (videoSubtitleBtn) {
+        videoSubtitleBtn.addEventListener('click', cycleSubtitle);
     }
     // 单击视频切换播放/暂停，双击切换内容全屏。双击会先触发两次 click，
     // 所以单击走 250ms 延时，双击时取消挂起的单击，避免状态闪变两次。
