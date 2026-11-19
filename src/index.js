@@ -55,6 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ---- 字幕轨道状态（-1 表示关闭） ----
     let subtitleTracks = [];
     let subtitleCurrent = -1;
+    let activeSubtitleTrack = null; // addTextTrack 创建的当前显示轨道
 
     // ---- Tauri API ----
     const tauri = window.__TAURI__;
@@ -884,33 +885,54 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ---- 字幕：重建轨道列表 + CC 按钮循环切换 ----
-    // <track> 的 src 延迟到真正选用时才生成，避免每次播放都提取所有字幕轨
+    // 不用 <track> 元素：WebView2/WebKit 对"后设 src 再切 mode"的动态 track
+    // 不触发加载。改为 fetch VTT 文本 + addTextTrack + addCue，完全由 JS 控制；
+    // 切歌时 media.load() 会自动清空 addTextTrack 创建的轨道。
     function rebuildSubtitleTracks(subs) {
         subtitleTracks = subs || [];
         subtitleCurrent = -1;
-        for (const el of Array.from(videoPlayer.querySelectorAll('track'))) {
-            el.remove();
-        }
+        activeSubtitleTrack = null;
         if (videoSubtitleBtn) {
             videoSubtitleBtn.style.display = subtitleTracks.length ? '' : 'none';
             videoSubtitleBtn.classList.remove('active');
             videoSubtitleBtn.textContent = 'CC';
         }
-        subtitleTracks.forEach((st, i) => {
-            const el = document.createElement('track');
-            el.kind = 'subtitles';
-            el.label = st.title || (st.language ? st.language.toUpperCase() : `字幕 ${i + 1}`);
-            el.srclang = st.language || '';
-            videoPlayer.appendChild(el);
-        });
+    }
+
+    // 极简 WebVTT 解析：只取 cue 的起止时间与文本行（跳过 WEBVTT/NOTE/STYLE 块）
+    function parseVtt(text) {
+        const cues = [];
+        const toSec = (s) => {
+            const m = s.trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})\.(\d{3})$/);
+            if (!m) return NaN;
+            return (m[1] ? +m[1] * 3600 : 0) + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+        };
+        const lines = String(text).replace(/\r/g, '').split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line.includes('-->')) continue;
+            const [a, b] = line.split('-->');
+            const start = toSec(a);
+            // b 以空格开头："--> 00:04.000"；split(/\s+/) 首元素会是空串，
+            // 必须取第一个非空 token
+            const end = toSec((b.split(/\s+/).find(Boolean)) || '');
+            const body = [];
+            for (i = i + 1; i < lines.length && lines[i] !== ''; i++) {
+                body.push(lines[i]);
+            }
+            if (isFinite(start) && isFinite(end) && body.length) {
+                cues.push({ start, end, text: body.join('\n') });
+            }
+        }
+        return cues;
     }
 
     async function cycleSubtitle() {
         const n = subtitleTracks.length;
         if (!n) return;
-        const tracks = videoPlayer.textTracks;
-        if (subtitleCurrent >= 0 && tracks[subtitleCurrent]) {
-            tracks[subtitleCurrent].mode = 'disabled';
+        if (activeSubtitleTrack) {
+            activeSubtitleTrack.mode = 'disabled';
+            activeSubtitleTrack = null;
         }
         subtitleCurrent += 1;
         if (subtitleCurrent >= n) {
@@ -923,19 +945,29 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         const st = subtitleTracks[subtitleCurrent];
-        const el = videoPlayer.querySelectorAll('track')[subtitleCurrent];
+        const label = st.title || (st.language ? st.language.toUpperCase() : `字幕 ${subtitleCurrent + 1}`);
         try {
-            if (el && !el.src) {
-                const item = playlist[currentIndex];
-                const url = await invoke('subtitle_url', { path: item.path, track: st.track });
-                el.src = url;
+            const item = playlist[currentIndex];
+            const url = await invoke('subtitle_url', { path: item.path, track: st.track });
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const vtt = await resp.text();
+            const cues = parseVtt(vtt);
+            const tt = videoPlayer.addTextTrack('subtitles', label, st.language || '');
+            let added = 0, failed = 0;
+            for (const cue of cues) {
+                try { tt.addCue(new VTTCue(cue.start, cue.end, cue.text)); added++; }
+                catch (e) { failed++; }
             }
-            if (tracks[subtitleCurrent]) tracks[subtitleCurrent].mode = 'showing';
+            tt.mode = 'showing';
+            activeSubtitleTrack = tt;
+            sendLog(`[subtitle] bytes=${vtt.length} cues=${cues.length} added=${added} failed=${failed} ` +
+                `videoDur=${videoPlayer.duration} cueSample=${cues[0] ? cues[0].start + '-' + cues[0].end : 'none'}`);
             if (videoSubtitleBtn) {
                 videoSubtitleBtn.classList.add('active');
                 videoSubtitleBtn.textContent = `CC${subtitleCurrent + 1}`;
             }
-            setStatus(`CC 字幕: ${el?.label || st.language || '轨 ' + (subtitleCurrent + 1)}`, 'info');
+            setStatus(`CC 字幕: ${label}`, 'info');
         } catch (e) {
             subtitleCurrent = -1;
             setStatus('❌ 字幕提取失败: ' + (e && e.message ? e.message : e), 'error');

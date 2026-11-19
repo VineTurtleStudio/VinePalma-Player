@@ -20,6 +20,12 @@ pub struct AppState {
 impl AppState {
     fn save_settings(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&*self.settings.lock().unwrap()) {
+            // app_config_dir() 只给路径不建目录：首次保存前必须先建出
+            // Roaming/<identifier>/，否则 fs::write 会静默失败，
+            // 所有持久化（列表/音量/主题）都将不落盘。
+            if let Some(parent) = self.settings_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(&self.settings_path, json);
         }
     }
