@@ -306,6 +306,10 @@ fn bottom_right(app: &AppHandle, w: f64, h: f64) -> (f64, f64) {
 /// window instead of creating a new one.
 #[tauri::command]
 fn open_mini(app: AppHandle) -> Result<bool, String> {
+    open_mini_impl(&app)
+}
+
+fn open_mini_impl(app: &AppHandle) -> Result<bool, String> {
     // 网易云式：进入迷你播放器时最小化主窗口，桌面上只留小卡片
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.minimize();
@@ -317,9 +321,9 @@ fn open_mini(app: AppHandle) -> Result<bool, String> {
         let _ = w.set_focus();
         return Ok(true);
     }
-    let (x, y) = bottom_right(&app, 340.0, 64.0);
+    let (x, y) = bottom_right(app, 340.0, 64.0);
     let window =
-        tauri::WebviewWindowBuilder::new(&app, "mini", tauri::WebviewUrl::App("mini.html".into()))
+        tauri::WebviewWindowBuilder::new(app, "mini", tauri::WebviewUrl::App("mini.html".into()))
             .title("VinePalma 迷你播放器")
             .inner_size(340.0, 64.0)
             .position(x, y)
@@ -344,16 +348,13 @@ fn open_mini(app: AppHandle) -> Result<bool, String> {
             gtk_win.set_size_request(340, 64);
             gtk_win.resize(340, 64);
         }
-        fix_transparent_click_through(&app, "mini");
+        fix_transparent_click_through(app, "mini");
     }
     Ok(true)
 }
 
-/// Close the mini player card and restore the main window.
-#[tauri::command]
-fn close_mini(app: AppHandle) -> Result<(), String> {
-    // 必须“先恢复主窗口、最后再关闭卡片”：命令执行中途一旦销毁发起命令
-    // 的 mini 窗口，剩余语句很可能被中断，导致“拉出主窗口”不生效。
+/// 拉回并聚焦主窗口（托盘"显示主窗口"、迷你卡恢复、二次启动唤起共用）。
+fn restore_main(app: &AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
         // 先取消最小化再 show：某些平台（X11）对已最小化的窗口先 show 后
         // unminimize 顺序不正确时不会真正恢复，所以统一先 unminimize。
@@ -361,6 +362,14 @@ fn close_mini(app: AppHandle) -> Result<(), String> {
         let _ = main.show();
         let _ = main.set_focus();
     }
+}
+
+/// Close the mini player card and restore the main window.
+#[tauri::command]
+fn close_mini(app: AppHandle) -> Result<(), String> {
+    // 必须“先恢复主窗口、最后再关闭卡片”：命令执行中途一旦销毁发起命令
+    // 的 mini 窗口，剩余语句很可能被中断，导致“拉出主窗口”不生效。
+    restore_main(&app);
     // 双保险：即使上面的窗口操作被窗口管理器拦截，主窗口 JS 收到该事件后
     // 也会在自己的进程里再执行一遍恢复。
     let _ = app.emit_to("main", "mini:close-restore", ());
@@ -382,11 +391,7 @@ fn mini_control(app: AppHandle, action: String, value: Option<f64>) -> Result<()
 /// Bring the main window to the front (clicking the mini card opens the player).
 #[tauri::command]
 fn mini_open_main(app: AppHandle) -> Result<(), String> {
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
+    restore_main(&app);
     Ok(())
 }
 
@@ -454,6 +459,36 @@ fn fix_transparent_click_through(app: &tauri::AppHandle, label: &str) {
         );
     }
     gtk_win.connect_map(|win| reset_input_region(&win.clone().upcast::<gtk::Window>()));
+}
+
+/// 构建系统托盘：显示主窗口 / 迷你播放器 / 退出。
+/// “关闭到托盘”开启时主窗口关闭仅隐藏，托盘是唯一显式退出入口。
+fn build_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let mini = MenuItem::with_id(app, "mini", "迷你播放器", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 VinePalma", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &mini, &quit])?;
+
+    TrayIconBuilder::with_id("vinepalma-tray")
+        .icon(app.default_window_icon().expect("应用图标未配置").clone())
+        .tooltip("VinePalma Player")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => restore_main(app),
+            "mini" => {
+                if let Err(e) = open_mini_impl(app) {
+                    crate::log::log(&format!("[tray] 打开迷你播放器失败: {e}"));
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -533,10 +568,43 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 settings_path,
             });
+
+            // 系统托盘：显示主窗口 / 迷你播放器 / 退出
+            build_tray(app.handle())?;
+
             #[cfg(target_os = "linux")]
             fix_transparent_click_through(app.handle(), "main");
             Ok(())
         })
+        // “关闭窗口时最小化到托盘”：默认开（store key closeToTray）。
+        // 拦截 main 窗口的关闭请求改为隐藏，真正退出走托盘菜单的“退出”。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let close_to_tray = window
+                        .app_handle()
+                        .try_state::<AppState>()
+                        .map(|s| {
+                            s.settings
+                                .lock()
+                                .unwrap()
+                                .get("closeToTray")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(true);
+                    if close_to_tray {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
+        })
+        // 单实例锁：二次启动时唤起已有主窗口后立即退出新进程。
+        // 必须最先注册（官方要求）。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            restore_main(app);
+        }))
         .invoke_handler(tauri::generate_handler![
             open_file,
             open_folder,
