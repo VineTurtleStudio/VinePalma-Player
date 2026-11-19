@@ -12,8 +12,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusEl = document.getElementById('status');
     const openBtn = document.getElementById('open-btn');
     const openFolderBtn = document.getElementById('open-folder-btn');
-    const playBtn = document.getElementById('play-btn');
-    const pauseBtn = document.getElementById('pause-btn');
     const menuToggleBtn = document.getElementById('menu-toggle-btn');
     const closePlaylistBtn = document.getElementById('close-playlist-btn');
     const playlistPanel = document.getElementById('playlist-panel');
@@ -60,7 +58,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (statusEl) statusEl.textContent = '❌ API 加载失败';
         return;
     }
-    const { invoke, convertFileSrc } = tauri.core;
+    const { invoke } = tauri.core;
     const { getCurrentWindow } = tauri.window;
     const { listen, emitTo } = tauri.event;
     const mainWindow = getCurrentWindow();
@@ -82,7 +80,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // 2. 播放列表数据
     // ============================================================
     let playlist = [];
-    // let fixedDuration = 0;     // 固定总时长（秒），用于显示和进度计算
     let currentIndex = -1;
     let isPlaying = false;
     let currentCoverUrl = null;
@@ -91,6 +88,38 @@ document.addEventListener('DOMContentLoaded', () => {
     let playMode = 0;
     const modeIcons = ['🔁', '🔂', '🔀'];
     const modeTitles = ['列表循环', '单曲循环', '随机播放'];
+
+    // 播放列表过滤（搜索框）
+    let playlistFilter = '';
+
+    // ---- 状态持久化（store key: playlistState）----
+    // 保存 { items, currentIndex, playMode, position }：重启后恢复列表与
+    // 上次曲目；position 只对 currentIndex 有效，下次点播放时续接。
+    let resumeIndex = -1;
+    let resumeAt = null; // 秒
+    let persistTimer = null;
+    function persistPlaylistState() {
+        if (persistTimer) clearTimeout(persistTimer);
+        persistTimer = setTimeout(() => {
+            persistTimer = null;
+            const media = activeMedia();
+            const position = (media && isFinite(media.currentTime)) ? media.currentTime : 0;
+            const state = {
+                items: playlist.map(item => ({
+                    path: item.path,
+                    name: item.name,
+                    duration: item.duration || 0,
+                    title: item.title,
+                    artist: item.artist,
+                    has_video: !!item.has_video,
+                })),
+                currentIndex,
+                playMode,
+                position,
+            };
+            invoke('store_set', { key: 'playlistState', value: state }).catch(() => {});
+        }, 500);
+    }
 
     // 曲目切换时的“待自动播放”标记：等 canplay 元数据就绪后再 play，避免
     // WebKitGTK 把提前 play 的音频当直播流（时长跟随缓冲位置增长）。
@@ -129,8 +158,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================================================
     function formatTime(seconds) {
         if (!isFiniteDuration(seconds)) return '0:00';
-        const m = Math.floor(seconds / 60);
-        const s = Math.floor(seconds % 60);
+        seconds = Math.max(0, Math.floor(seconds));
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
         return `${m}:${s.toString().padStart(2, '0')}`;
     }
 
@@ -145,9 +177,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         playlistEmpty.style.display = 'none';
         playlistEl.style.display = 'block';
-        playlistCount.textContent = `(${playlist.length} 首)`;
+        playlistCount.textContent = playlistFilter
+            ? `(${playlist.filter(item => matchesFilter(item)).length}/${playlist.length} 首)`
+            : `(${playlist.length} 首)`;
 
         playlist.forEach((item, idx) => {
+            if (!matchesFilter(item)) return;
             const li = document.createElement('li');
             li.className = 'playlist-item' + (idx === currentIndex ? ' active' : '');
             li.dataset.index = idx;
@@ -186,21 +221,33 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function matchesFilter(item) {
+        if (!playlistFilter) return true;
+        const hay = `${item.title || ''} ${item.artist || ''}`.toLowerCase();
+        return hay.includes(playlistFilter);
+    }
+
+    // 统一两条导入路径共用的字段映射
+    function normalizeTrack(meta) {
+        return {
+            path: meta.path,
+            name: meta.name,
+            duration: meta.duration || 0,
+            title: meta.title || meta.name,
+            artist: meta.artist || '未知艺术家',
+            has_video: !!meta.has_video,
+        };
+    }
+
     function addSingleFile(metadata) {
         if (!metadata) return false;
         if (playlist.some(item => item.path === metadata.path)) {
             setStatus('⏳ 文件已在列表中', 'info');
             return false;
         }
-        playlist.push({
-            path: metadata.path,
-            name: metadata.name,
-            duration: metadata.duration || 0,
-            title: metadata.title || metadata.name,
-            artist: metadata.artist || '未知艺术家',
-            has_video: !!metadata.has_video,
-        });
+        playlist.push(normalizeTrack(metadata));
         updatePlaylistUI();
+        persistPlaylistState();
         if (currentIndex === -1) {
             playIndex(playlist.length - 1);
         }
@@ -209,36 +256,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function addMultipleFiles(metadataList) {
         if (!metadataList || metadataList.length === 0) {
-            setStatus('⚠️ 文件夹中没有支持的音频文件', 'error');
-            return;
+            setStatus('⚠️ 没有找到支持的媒体文件', 'error');
+            return 0;
         }
         let added = 0;
         metadataList.forEach(meta => {
             if (!playlist.some(item => item.path === meta.path)) {
-                playlist.push({
-                    path: meta.path,
-                    name: meta.name,
-                    duration: meta.duration || 0,
-                    title: meta.title || meta.name,
-                    artist: meta.artist || '未知艺术家',
-                    has_video: !!meta.has_video,
-                });
+                playlist.push(normalizeTrack(meta));
                 added++;
             }
         });
         updatePlaylistUI();
+        persistPlaylistState();
         if (added > 0 && currentIndex === -1) {
             playIndex(0);
         }
-        setStatus(`✅ 成功导入 ${added} 首歌曲`, 'success');
+        return added;
     }
 
     function removeFromPlaylist(index) {
         if (index < 0 || index >= playlist.length) return;
-        const wasPlaying = (index === currentIndex && isPlaying);
         playlist.splice(index, 1);
         if (currentIndex === index) {
             currentIndex = -1;
+            resumeIndex = -1;
+            resumeAt = null;
             if (playlist.length > 0) {
                 const newIdx = Math.min(index, playlist.length - 1);
                 playIndex(newIdx);
@@ -250,17 +292,21 @@ document.addEventListener('DOMContentLoaded', () => {
             currentIndex--;
         }
         updatePlaylistUI();
+        persistPlaylistState();
     }
 
     function clearPlaylist() {
         if (playlist.length === 0) return;
         stopPlayback();
         currentIndex = -1;
+        resumeIndex = -1;
+        resumeAt = null;
         playlist = [];
         updatePlaylistUI();
         updateSongInfo(null);
         updatePlayToggleIcon();
         updateCover(null);
+        persistPlaylistState();
         setStatus('🗑 列表已清空', 'info');
     }
 
@@ -297,6 +343,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const media = isVideo ? videoPlayer : audioPlayer;
             media.src = url;
+            media.playbackRate = currentRate;
             media.load();
 
             // ⚠️ 关键：不要立刻 play()。WebKitGTK 若在元数据就绪前就 play，
@@ -310,6 +357,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (autoplayCb === autoplayOnce) autoplayCb = null;
                 if (pendingAutoplay) {
                     pendingAutoplay = false;
+                    // 恢复上次退出时的播放位置（仅对上次正在播的那一首生效）
+                    if (resumeIndex === index && resumeAt != null && isFinite(resumeAt)) {
+                        media.currentTime = clampSeekTarget(media, resumeAt);
+                    }
+                    resumeAt = null;
+                    resumeIndex = -1;
                     media.play().catch(err => console.warn('[Renderer] 自动播放被阻止:', err));
                 }
             };
@@ -344,6 +397,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             updatePlaylistUI();
             emitMiniState();
+            persistPlaylistState();
             setStatus(`▶ 正在播放: ${item.title}`, 'success');
         } catch (err) {
             console.error('[Renderer] 解码失败:', err);
@@ -355,25 +409,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function randomIndex() {
+        let idx;
+        do { idx = Math.floor(Math.random() * playlist.length); } while (idx === currentIndex && playlist.length > 1);
+        return idx;
+    }
+
     function playNext() {
         if (playlist.length === 0) return;
-        let idx;
-        if (playMode === 2) {
-            do { idx = Math.floor(Math.random() * playlist.length); } while (idx === currentIndex && playlist.length > 1);
-        } else {
-            idx = (currentIndex + 1) % playlist.length;
-        }
+        const idx = (playMode === 2) ? randomIndex() : (currentIndex + 1) % playlist.length;
         playIndex(idx);
     }
 
     function playPrev() {
         if (playlist.length === 0) return;
-        let idx;
-        if (playMode === 2) {
-            do { idx = Math.floor(Math.random() * playlist.length); } while (idx === currentIndex && playlist.length > 1);
-        } else {
-            idx = (currentIndex - 1 + playlist.length) % playlist.length;
-        }
+        const idx = (playMode === 2) ? randomIndex() : (currentIndex - 1 + playlist.length) % playlist.length;
         playIndex(idx);
     }
 
@@ -386,12 +436,19 @@ document.addEventListener('DOMContentLoaded', () => {
             playIndex(0);
             return;
         }
+        // 启动恢复后列表已填充但尚未加载媒体：走 playIndex 完成加载与
+        // 自动续接上次播放位置。
         const media = activeMedia();
+        if (!media.src) {
+            playIndex(currentIndex);
+            return;
+        }
         if (isPlaying) {
             media.pause();
             pendingAutoplay = false;
             isPlaying = false;
             updatePlayToggleIcon();
+            persistPlaylistState();
             setStatus('⏸ 已暂停', 'info');
         } else {
             media.play().catch(err => {
@@ -501,30 +558,109 @@ document.addEventListener('DOMContentLoaded', () => {
         else volumeIcon.textContent = '🔊';
     }
 
+    // 音量持久化（防抖）：滑块、滚轮、快捷键统一走 applyVolume，
+    // 避免每个 input 事件都触发一次 store_set 写盘
+    let volumePersistTimer = null;
+    function schedulePersistVolume() {
+        if (volumePersistTimer) clearTimeout(volumePersistTimer);
+        volumePersistTimer = setTimeout(() => {
+            volumePersistTimer = null;
+            const v = parseFloat(volumeSlider.value) || 0;
+            invoke('store_set', { key: 'volume', value: v }).catch(() => {});
+        }, 300);
+    }
+    function applyVolume(v) {
+        v = Math.max(0, Math.min(100, v));
+        volumeSlider.value = v;
+        if (v > 0) lastVolume = v;
+        updateVolumeUI(v);
+        schedulePersistVolume();
+    }
+
     // ============================================================
-    // 4. 迷你播放器同步（置顶小卡片）
+    // 4. 迷你播放器同步（置顶小卡片）+ 系统媒体会话
     // ============================================================
     function emitMiniState() {
-        if (!emitTo) return;
         const item = playlist[currentIndex];
-        emitTo('mini', 'mini:state', {
-            title: item?.title || '',
-            artist: item?.artist || '',
-            cover: currentCoverUrl || null,
-            playing: !!isPlaying,
-            has_video: !!(item && item.has_video),
-            duration: currentDuration(),
-        }).catch(() => {});
+        if (emitTo) {
+            emitTo('mini', 'mini:state', {
+                title: item?.title || '',
+                artist: item?.artist || '',
+                cover: currentCoverUrl || null,
+                playing: !!isPlaying,
+                duration: currentDuration(),
+            }).catch(() => {});
+        }
+        updateMediaSession();
     }
 
     function emitMiniProgress() {
-        if (!emitTo) return;
         const media = activeMedia();
-        if (!media) return;
-        emitTo('mini', 'mini:progress', {
-            current: media.currentTime || 0,
-            duration: currentDuration(),
-        }).catch(() => {});
+        if (emitTo && media) {
+            emitTo('mini', 'mini:progress', {
+                current: media.currentTime || 0,
+                duration: currentDuration(),
+            }).catch(() => {});
+        }
+        updateMediaSessionPosition();
+    }
+
+    // ---- MediaSession：系统媒体键 / 锁屏与系统面板控制 ----
+    function updateMediaSession() {
+        if (!('mediaSession' in navigator)) return;
+        const item = playlist[currentIndex];
+        try {
+            navigator.mediaSession.metadata = item ? new MediaMetadata({
+                title: item.title || item.name || '',
+                artist: item.artist || '',
+                album: 'VinePalma Player',
+                artwork: currentCoverUrl
+                    ? [{ src: currentCoverUrl, sizes: '512x512', type: 'image/jpeg' }]
+                    : [],
+            }) : null;
+            navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+        } catch (e) { /* 系统不支持时静默 */ }
+    }
+
+    function updateMediaSessionPosition() {
+        if (!('mediaSession' in navigator)) return;
+        const media = activeMedia();
+        const dur = currentDuration();
+        if (!media || dur <= 0) return;
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: dur,
+                position: Math.min(media.currentTime || 0, dur),
+                playbackRate: media.playbackRate || 1,
+            });
+        } catch (e) { /* 时长/倍速非法时 setPositionState 会抛错 */ }
+    }
+
+    if ('mediaSession' in navigator) {
+        const ms = navigator.mediaSession;
+        const safeSetHandler = (name, fn) => {
+            try { ms.setActionHandler(name, fn); } catch (e) { /* 动作不支持 */ }
+        };
+        safeSetHandler('play', () => { const m = activeMedia(); if (m) m.play().catch(() => {}); });
+        safeSetHandler('pause', () => { const m = activeMedia(); if (m) m.pause(); });
+        safeSetHandler('previoustrack', playPrev);
+        safeSetHandler('nexttrack', playNext);
+        safeSetHandler('seekbackward', (details) => {
+            const m = activeMedia();
+            if (m) m.currentTime = Math.max(0, m.currentTime - (details.seekOffset || 10));
+        });
+        safeSetHandler('seekforward', (details) => {
+            const m = activeMedia();
+            if (m && currentDuration() > 0) {
+                m.currentTime = clampSeekTarget(m, m.currentTime + (details.seekOffset || 10));
+            }
+        });
+        safeSetHandler('seekto', (details) => {
+            const m = activeMedia();
+            if (m && currentDuration() > 0 && isFinite(details.seekTime)) {
+                m.currentTime = clampSeekTarget(m, details.seekTime);
+            }
+        });
     }
 
     function openPlaylist() {
@@ -659,6 +795,49 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // ---- 窗口几何记忆：移动/缩放（防抖）后保存，Rust 启动时应用 ----
+    let geoTimer = null;
+    function saveWindowGeometry() {
+        if (geoTimer) clearTimeout(geoTimer);
+        geoTimer = setTimeout(async () => {
+            try {
+                if (await mainWindow.isMaximized()) {
+                    await invoke('store_set', { key: 'windowGeometry', value: { maximized: true } });
+                    return;
+                }
+                const pos = mainWindow.outerPosition();   // 物理像素
+                const size = mainWindow.outerSize();
+                await invoke('store_set', {
+                    key: 'windowGeometry',
+                    value: { x: pos.x, y: pos.y, width: size.width, height: size.height, maximized: false },
+                });
+            } catch (e) { /* 保存失败不影响使用 */ }
+        }, 400);
+    }
+    mainWindow.onMoved(saveWindowGeometry);
+    mainWindow.onResized(saveWindowGeometry);
+
+    // ---- 拖放导入：文件或文件夹直接拖进窗口 ----
+    try {
+        mainWindow.onDragDropEvent((event) => {
+            if (event.payload.type !== 'drop') return;
+            const paths = (event.payload.paths || []).filter(Boolean);
+            if (!paths.length) return;
+            setStatus('⏳ 解析拖入的文件...', 'info');
+            invoke('scan_paths', { paths }).then((list) => {
+                const added = addMultipleFiles(list);
+                if (added > 0) {
+                    fileInfo.textContent = `📂 导入 ${added} 个文件`;
+                    setStatus(`✅ 已导入 ${added} 个文件`, 'success');
+                }
+            }).catch((err) => {
+                setStatus('❌ 导入失败: ' + (err && err.message ? err.message : err), 'error');
+            });
+        });
+    } catch (e) {
+        console.warn('[Renderer] 拖放监听注册失败:', e);
+    }
+
     // ---- 设置按钮（点击一次打开，再次点击或点设置页叉号关闭） ----
     if (settingsBtn) {
         settingsBtn.addEventListener('click', async () => {
@@ -687,18 +866,22 @@ document.addEventListener('DOMContentLoaded', () => {
             toggleContentFullscreen();
         });
     }
+    // 单击视频切换播放/暂停，双击切换内容全屏。双击会先触发两次 click，
+    // 所以单击走 250ms 延时，双击时取消挂起的单击，避免状态闪变两次。
+    let videoClickTimer = null;
     videoWrap.addEventListener('dblclick', () => {
+        if (videoClickTimer) { clearTimeout(videoClickTimer); videoClickTimer = null; }
         toggleContentFullscreen();
     });
-    // 单击视频切换播放/暂停（video 本身 pointer-events:none，事件落在容器上；
+    // （video 本身 pointer-events:none，事件落在容器上；
     // 点击浮层按钮/进度条时忽略）
     videoWrap.addEventListener('click', (e) => {
         if (e.target.closest('button') || e.target.closest('input')) return;
-        if (videoPlayer.paused) {
-            videoPlayer.play().catch(() => {});
-        } else {
-            videoPlayer.pause();
-        }
+        if (videoClickTimer) return; // 双击的第二次 click，交给 dblclick 处理
+        videoClickTimer = setTimeout(() => {
+            videoClickTimer = null;
+            togglePlayPause();
+        }, 250);
     });
 
     // ---- 视频控制浮层自动隐藏：播放中鼠标不动约 2.5s 后隐藏视频上的控制层
@@ -795,43 +978,17 @@ document.addEventListener('DOMContentLoaded', () => {
             setStatus('⏳ 扫描文件夹中...', 'info');
             try {
                 const metadataList = await invoke('open_folder');
-                addMultipleFiles(metadataList);
-                if (metadataList.length > 0) {
-                    fileInfo.textContent = `📂 导入 ${metadataList.length} 个文件`;
+                const added = addMultipleFiles(metadataList);
+                if (added > 0) {
+                    fileInfo.textContent = `📂 导入 ${added} 个文件`;
+                    setStatus(`✅ 成功导入 ${added} 个文件`, 'success');
+                } else if (metadataList && metadataList.length > 0) {
+                    setStatus('ℹ️ 所选内容均已存在于列表中', 'info');
                 } else {
-                    setStatus('⚠️ 文件夹中没有支持的音频文件', 'error');
+                    setStatus('⚠️ 文件夹中没有支持的媒体文件', 'error');
                 }
             } catch (error) {
                 setStatus('❌ 错误: ' + error.message, 'error');
-            }
-        });
-    }
-
-    // 播放/暂停
-    if (playBtn) {
-        playBtn.addEventListener('click', () => {
-            const media = activeMedia();
-            if (media && media.src) {
-                media.play();
-                isPlaying = true;
-                updatePlayToggleIcon();
-                const item = playlist[currentIndex];
-                setStatus(`▶ 播放中: ${item?.title || ''}`, 'success');
-                emitMiniState();
-            } else {
-                setStatus('⚠️ 请先选择音乐文件', 'error');
-            }
-        });
-    }
-    if (pauseBtn) {
-        pauseBtn.addEventListener('click', () => {
-            const media = activeMedia();
-            if (media) {
-                media.pause();
-                isPlaying = false;
-                updatePlayToggleIcon();
-                setStatus('⏸ 已暂停', 'info');
-                emitMiniState();
             }
         });
     }
@@ -856,6 +1013,39 @@ document.addEventListener('DOMContentLoaded', () => {
         modeBtn.addEventListener('click', () => {
             playMode = (playMode + 1) % 3;
             updateModeBtn();
+            persistPlaylistState();
+        });
+    }
+
+    // ---- 倍速播放：1.0 → 1.25 → 1.5 → 2.0 → 0.75 循环，记忆上次选择 ----
+    const RATES = [1.0, 1.25, 1.5, 2.0, 0.75];
+    let rateIdx = 0;
+    let currentRate = RATES[0];
+    const rateBtn = document.getElementById('rate-btn');
+    function updateRateBtn() {
+        if (!rateBtn) return;
+        const r = RATES[rateIdx];
+        currentRate = r;
+        rateBtn.textContent = (r === 1 ? '1x' : `${r}x`);
+        rateBtn.title = `播放速度 ${r}x`;
+        // 两个媒体元素都设置；元素属性在换曲（重设 src）后依然保留
+        audioPlayer.playbackRate = r;
+        videoPlayer.playbackRate = r;
+        updateMediaSessionPosition();
+    }
+    invoke('store_get', { key: 'playbackRate' })
+        .then((saved) => {
+            const v = parseFloat(saved);
+            const i = RATES.findIndex(r => Math.abs(r - v) < 0.001);
+            if (i >= 0) { rateIdx = i; updateRateBtn(); }
+        })
+        .catch(() => {});
+    if (rateBtn) {
+        rateBtn.addEventListener('click', () => {
+            rateIdx = (rateIdx + 1) % RATES.length;
+            updateRateBtn();
+            invoke('store_set', { key: 'playbackRate', value: RATES[rateIdx] }).catch(() => {});
+            setStatus(`⏩ 播放速度 ${RATES[rateIdx]}x`, 'info');
         });
     }
 
@@ -1074,22 +1264,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const v = parseFloat(volumeSlider.value);
             if (v > 0) lastVolume = v;
             updateVolumeUI(v);
-            invoke('store_set', { key: 'volume', value: v }).catch(() => {});
+            schedulePersistVolume();
         });
 
         if (volumeIcon) {
             volumeIcon.addEventListener('click', () => {
                 const cur = parseFloat(volumeSlider.value) || 0;
                 if (cur > 0) {
-                    lastVolume = cur;
-                    volumeSlider.value = 0;
-                    updateVolumeUI(0);
-                    invoke('store_set', { key: 'volume', value: 0 }).catch(() => {});
+                    applyVolume(0);
                 } else {
-                    const v = lastVolume > 0 ? lastVolume : 40;
-                    volumeSlider.value = v;
-                    updateVolumeUI(v);
-                    invoke('store_set', { key: 'volume', value: v }).catch(() => {});
+                    applyVolume(lastVolume > 0 ? lastVolume : 40);
                 }
             });
         }
@@ -1102,10 +1286,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.target.closest('.progress-slider')) return;
         e.preventDefault();
         const step = e.deltaY < 0 ? 5 : -5;
-        let v = parseFloat(volumeSlider.value) + step;
-        v = Math.max(0, Math.min(100, v));
-        volumeSlider.value = v;
-        updateVolumeUI(v);
+        applyVolume(parseFloat(volumeSlider.value) + step);
     }
     document.addEventListener('wheel', wheelAdjustVolume, { passive: false });
 
@@ -1122,7 +1303,8 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         media.addEventListener('timeupdate', () => {
-            if (draggingProgress) return; // 拖动中不更新进度条值（但当前时间仍可更新）
+            if (draggingProgress) return; // 拖动中不更新进度条值
+            persistPlaylistState(); // 防抖写入：为"重启续播"记录位置
             const dur = currentDuration();
             if (dur > 0) {
                 const percent = Math.min((media.currentTime / dur) * 1000, 1000);
@@ -1206,31 +1388,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         media.addEventListener('durationchange', () => {
             logMediaEvent('durationchange');
-            // const newDur = media.duration;
-            // if (isFiniteDuration(newDur) && newDur > 0) {
-            //     // 如果 fixedDuration 为 0 或差异大于 0.5 秒，则更新
-            //     if (fixedDuration === 0 || Math.abs(newDur - fixedDuration) > 0.5) {
-            //         fixedDuration = newDur;
-            //         totalTimeEl.textContent = formatTime(fixedDuration);
-            //         if (media === videoPlayer && videoTotalEl) {
-            //             videoTotalEl.textContent = formatTime(fixedDuration);
-            //         }
-            //         progressBar.disabled = false;
-            //         progressBar.style.opacity = '1';
-            //         if (videoProgressBar) {
-            //             videoProgressBar.disabled = false;
-            //             videoProgressBar.style.opacity = '1';
-            //         }
-            //         if (currentIndex >= 0 && playlist[currentIndex]) {
-            //             playlist[currentIndex].duration = fixedDuration;
-            //             updatePlaylistUI();
-            //         }
-            //         emitMiniState();
-            //     }
-            //     // 否则忽略微小变化
-            // } else {
-            //     // 无效时长不更新
-            // }
         });
 
 
@@ -1292,8 +1449,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (videoPlayer) bindMediaEvents(videoPlayer);
 
     // ---- 键盘快捷键 ----
+    // Space 播放/暂停；←/→ seek ±5s；↑/↓ 音量 ±5；M 静音；N/P 切歌；
+    // F 窗口全屏；L 播放模式；0-9 跳到对应百分比；Esc 退出全屏/关列表
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT') return;
+        if (e.ctrlKey || e.altKey || e.metaKey) return; // 不劫持系统组合键
         if (e.key === ' ' || e.code === 'Space') {
             e.preventDefault();
             togglePlayPause();
@@ -1308,29 +1468,111 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.key === 'ArrowLeft') {
             e.preventDefault();
             const media = activeMedia();
-            if (media) {
-                media.currentTime = Math.max(media.currentTime - 5, 0);
+            if (media && currentDuration() > 0) {
+                media.currentTime = clampSeekTarget(media, media.currentTime - 5);
+            }
+        }
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            applyVolume(parseFloat(volumeSlider.value) + 5);
+        }
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            applyVolume(parseFloat(volumeSlider.value) - 5);
+        }
+        if (e.key === 'm' || e.key === 'M') {
+            const cur = parseFloat(volumeSlider.value) || 0;
+            applyVolume(cur > 0 ? 0 : (lastVolume > 0 ? lastVolume : 40));
+        }
+        if (e.key === 'n' || e.key === 'N') playNext();
+        if (e.key === 'p' || e.key === 'P') playPrev();
+        if (e.key === 'f' || e.key === 'F') {
+            winFullBtn && winFullBtn.click();
+        }
+        if (e.key === 'l' || e.key === 'L') {
+            modeBtn && modeBtn.click();
+        }
+        if (/^[0-9]$/.test(e.key)) {
+            const media = activeMedia();
+            const dur = currentDuration();
+            if (media && dur > 0) {
+                media.currentTime = clampSeekTarget(media, dur * (parseInt(e.key, 10) / 10));
             }
         }
         if (e.key === 'Escape') {
             if (inContentFullscreen) {
-                exitContentFullscreen();
+                exitContentFullscreen().catch(() => {});
             }
             closePlaylist();
         }
     });
 
+    // ---- 播放列表搜索过滤 ----
+    const searchInput = document.getElementById('playlist-search');
+    if (searchInput) {
+        searchInput.addEventListener('input', () => {
+            playlistFilter = searchInput.value.trim().toLowerCase();
+            updatePlaylistUI();
+        });
+    }
+
+    // 恢复上次退出时的播放列表与曲目（不自动播放；点播放键从上次位置续播）
+    async function restoreLastState() {
+        try {
+            const saved = await invoke('store_get', { key: 'playlistState' });
+            if (!saved || !Array.isArray(saved.items) || saved.items.length === 0) {
+                updatePlaylistUI();
+                return;
+            }
+            playlist = saved.items
+                .filter(item => item && item.path)
+                .map(item => ({
+                    path: item.path,
+                    name: item.name,
+                    duration: item.duration || 0,
+                    title: item.title || item.name,
+                    artist: item.artist || '未知艺术家',
+                    has_video: !!item.has_video,
+                }));
+            playMode = [0, 1, 2].includes(saved.playMode) ? saved.playMode : 0;
+            const idx = (Number.isInteger(saved.currentIndex)
+                && saved.currentIndex >= 0
+                && saved.currentIndex < playlist.length)
+                ? saved.currentIndex
+                : -1;
+            currentIndex = idx;
+            if (idx >= 0) {
+                const pos = parseFloat(saved.position);
+                if (isFinite(pos) && pos > 0) {
+                    resumeIndex = idx;
+                    resumeAt = pos;
+                }
+                updateSongInfo(playlist[idx]);
+                loadCover(playlist[idx].path);
+            }
+            updatePlaylistUI();
+            updateModeBtn();
+            emitMiniState();
+            if (idx >= 0) {
+                setStatus('✅ 已恢复上次播放列表，按播放键继续', 'success');
+            }
+        } catch (e) {
+            console.warn('[Renderer] 恢复播放状态失败:', e);
+            updatePlaylistUI();
+        }
+    }
+
     // ============================================================
     // 7. 初始化
     // ============================================================
-    updatePlaylistUI();
     updateSongInfo(null);
     updatePlayToggleIcon();
     updateCover(null);
     updateModeBtn();
-    setStatus('✅ 就绪，选择音乐文件或导入文件夹开始播放', 'success');
+    setStatus('✅ 就绪，选择媒体文件、导入文件夹或直接拖入文件开始播放', 'success');
     // 加载主题
     loadTheme();
+    restoreLastState();
     console.log('[Renderer] 初始化完成');
 });
 

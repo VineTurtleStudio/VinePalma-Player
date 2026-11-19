@@ -45,6 +45,8 @@ window.Theme = (function () {
             accentHover: darken(p.accent, 0.12),
             border: 'rgba(0,0,0,0.08)',
             cardBg: 'rgba(255,255,255,0.55)',
+            // 播放列表等悬浮面板：由当前背景色向白色混合，深浅主题都不突兀
+            panelBg: mix(p.bg, '#ffffff', 0.45),
             coverBg: `linear-gradient(145deg, ${mix(p.bg, p.secondary, 0.4)}, ${mix(p.bg, p.primary, 0.28)})`
         };
     }
@@ -85,6 +87,7 @@ window.Theme = (function () {
         root.style.setProperty('--accent-hover', colors.accentHover);
         root.style.setProperty('--border-color', colors.border);
         root.style.setProperty('--card-bg', colors.cardBg);
+        root.style.setProperty('--panel-bg', colors.panelBg);
         root.style.setProperty('--cover-bg', colors.coverBg);
         return colors;
     }

@@ -26,15 +26,19 @@
 
     function formatTime(s) {
         if (!s || isNaN(s) || !isFinite(s) || s < 0) return '0:00';
-        const m = Math.floor(s / 60);
-        const sec = Math.floor(s % 60);
+        s = Math.floor(s);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
         return `${m}:${sec.toString().padStart(2, '0')}`;
     }
 
     function setState(s) {
         if (!s) return;
-        if (s.title) titleEl.textContent = s.title;
-        if (s.artist) artistEl.textContent = s.artist;
+        // 无条件覆盖，避免清空列表后迷你卡残留上一首的标题/封面
+        titleEl.textContent = s.title || '';
+        artistEl.textContent = s.artist || '';
         if (s.cover) {
             coverImg.src = s.cover;
             coverImg.style.display = 'block';
@@ -84,14 +88,36 @@
         invoke('close_mini');
     });
 
+    // 与主窗口一致：input 只预览并暂存最新值，pointerup/change 才提交 seek。
+    // 逐 input 事件直接 seek 会产生 IPC 风暴并反复打断播放。
+    let pendingSeekPercent = null;
     progressBar.addEventListener('pointerdown', () => { dragging = true; });
-    progressBar.addEventListener('pointerup', () => { dragging = false; });
+    progressBar.addEventListener('pointerup', () => {
+        if (pendingSeekPercent != null) commitSeek(); else dragging = false;
+    });
+    progressBar.addEventListener('pointercancel', () => {
+        dragging = false;
+        pendingSeekPercent = null;
+    });
+    progressBar.addEventListener('change', commitSeek);
     progressBar.addEventListener('input', () => {
         if (!duration || duration <= 0) return;
-        const target = (parseFloat(progressBar.value) / 1000) * duration;
+        const p = parseFloat(progressBar.value) / 1000;
+        pendingSeekPercent = p;
+        currentEl.textContent = formatTime(p * duration);
+    });
+
+    function commitSeek() {
+        dragging = false;
+        const percent = (pendingSeekPercent != null)
+            ? pendingSeekPercent
+            : (parseFloat(progressBar.value) / 1000);
+        pendingSeekPercent = null;
+        if (!duration || duration <= 0 || !isFinite(percent)) return;
+        const target = percent * duration;
         currentEl.textContent = formatTime(target);
         invoke('mini_control', { action: 'seek', value: target });
-    });
+    }
 
     // 点击卡片空白处不再弹回主窗口（卡片整体是可拖动区域，
     // 恢复主窗口请用右上角的 ✕ 按钮：它会关闭卡片并取消最小化主窗口）。

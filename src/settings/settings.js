@@ -6,6 +6,7 @@ try {
     const emit = tauri ? tauri.event.emit : null;
 
     const closeBtn = document.getElementById('close-settings-btn');
+    const closeToTrayEl = document.getElementById('close-to-tray');
     const autoCard = document.getElementById('auto-card');
     const autoPreview = document.getElementById('auto-preview');
     const monthGrid = document.getElementById('month-grid');
@@ -143,7 +144,22 @@ try {
         await saveTheme('custom', custom);
     });
 
+    // 通用行为：关闭窗口时最小化到托盘（默认开）
+    async function loadBehaviorSettings() {
+        if (!invoke || !closeToTrayEl) return;
+        try {
+            const saved = await invoke('store_get', { key: 'closeToTray' });
+            closeToTrayEl.checked = saved === null || saved === undefined ? true : !!saved;
+        } catch (e) {
+            closeToTrayEl.checked = true;
+        }
+        closeToTrayEl.addEventListener('change', () => {
+            invoke('store_set', { key: 'closeToTray', value: closeToTrayEl.checked }).catch(() => {});
+        });
+    }
+
     loadSettings();
+    loadBehaviorSettings();
     console.log('[Settings] 设置页初始化完成');
 
 } catch (error) {

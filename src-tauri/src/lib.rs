@@ -139,6 +139,29 @@ async fn open_folder(app: AppHandle) -> Result<Vec<media::TrackInfo>, String> {
     Ok(media::probe_all(&app, &cache_dir, files))
 }
 
+/// Scan dropped paths (files and/or folders) and return metadata for every
+/// media file found. Folders are scanned recursively; plain files are probed
+/// directly. Used by the frontend's drag-drop import.
+#[tauri::command]
+async fn scan_paths(app: AppHandle, paths: Vec<String>) -> Result<Vec<media::TrackInfo>, String> {
+    let mut files = Vec::new();
+    for p in &paths {
+        let path = std::path::PathBuf::from(p);
+        if path.is_dir() {
+            files.extend(media::scan_media_files(&path));
+        } else if media::is_media_file(&path) {
+            files.push(path);
+        }
+    }
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    files.sort();
+    files.dedup();
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    Ok(media::probe_all(&app, &cache_dir, files))
+}
+
 /// Return a streamable URL for an audio track.
 /// `path` is a base64-encoded (raw bytes) file path.
 /// Native formats are served lazily as-is by the stream server, so no upfront
@@ -434,10 +457,49 @@ pub fn run() {
             let stream = StreamState::start(app.handle().clone(), cache_dir);
 
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let settings = std::fs::read_to_string(&settings_path)
+            let settings: serde_json::Map<String, Value> = std::fs::read_to_string(&settings_path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
+
+            // 应用窗口几何记忆（物理像素）：记住的是最大化则直接最大化；位置
+            // 中心点不在任何显示器上时放弃恢复位置，避免窗口跑到屏幕外。
+            if let Some(geo) = settings.get("windowGeometry").and_then(|v| v.as_object()) {
+                if let Some(main) = app.get_webview_window("main") {
+                    let get_f = |k: &str| geo.get(k).and_then(|v| v.as_f64());
+                    let maximized = geo
+                        .get("maximized")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if maximized {
+                        let _ = main.maximize();
+                    } else if let (Some(x), Some(y), Some(w), Some(h)) =
+                        (get_f("x"), get_f("y"), get_f("width"), get_f("height"))
+                    {
+                        use tauri::{PhysicalPosition, PhysicalSize};
+                        let (w, h) = (w.round().max(480.0) as u32, h.round().max(540.0) as u32);
+                        let (x, y) = (x.round() as i32, y.round() as i32);
+                        let on_screen =
+                            app.available_monitors()
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|m| {
+                                    let pos = m.position();
+                                    let size = m.size();
+                                    let cx = x + (w as i32) / 2;
+                                    let cy = y + (h as i32) / 2;
+                                    cx >= pos.x
+                                        && cx < pos.x + size.width as i32
+                                        && cy >= pos.y
+                                        && cy < pos.y + size.height as i32
+                                });
+                        if on_screen {
+                            let _ = main.set_position(PhysicalPosition::new(x, y));
+                        }
+                        let _ = main.set_size(PhysicalSize::new(w, h));
+                    }
+                }
+            }
 
             app.manage(AppState {
                 stream,
@@ -451,6 +513,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_file,
             open_folder,
+            scan_paths,
             stream_url,
             video_url,
             get_cover,

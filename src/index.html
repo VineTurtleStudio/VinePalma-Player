@@ -80,10 +80,8 @@
             <button id="mode-btn" class="ctrl-btn" title="列表循环">🔁</button>
             <button id="prev-btn" class="ctrl-btn" title="上一首">⏮</button>
             <button id="play-toggle-btn" class="ctrl-btn primary-btn" title="播放/暂停">▶</button>
-            <!-- 保留原有 play / pause 按钮（隐藏） -->
-            <button id="play-btn" style="display:none;">▶</button>
-            <button id="pause-btn" style="display:none;">⏸</button>
             <button id="next-btn" class="ctrl-btn" title="下一首">⏭</button>
+            <button id="rate-btn" class="ctrl-btn ctrl-btn-text" title="播放速度">1x</button>
 
             <!-- 音量 -->
             <div class="volume-wrap">
@@ -106,6 +104,7 @@
             <button id="clear-playlist-btn" class="btn-ghost-sm" title="清空列表">🗑</button>
             <button id="close-playlist-btn" class="btn-ghost-sm" title="关闭列表">✕</button>
         </div>
+        <input type="text" id="playlist-search" class="playlist-search" placeholder="🔍 搜索标题 / 艺术家" />
         <ul class="playlist" id="playlist"></ul>
         <div class="playlist-empty" id="playlist-empty">暂无歌曲，点击下方按钮添加</div>
         <!-- 文件操作：固定在播放列表底部，始终可见 -->

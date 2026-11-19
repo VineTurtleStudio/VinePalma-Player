@@ -38,7 +38,9 @@ body {
     width: 100%;            /* ✅ 改成 100%，精确填满窗口尺寸 */
     height: 100%;
     max-width: none;        /* 取消之前的 max-width 限制 */
-    background: #fbf5ef;    /* ✅ 卡片背景为实心米白色 */
+    /* 背景跟随主题（--bg-primary 由 theme.js 按当前色板写入；
+       此前硬编码 #fbf5ef 导致换任何主题窗口背景都不变） */
+    background: var(--bg-primary, #fbf5ef);
     border-radius: 28px;    /* ✅ 保持弧形边角 */
     overflow: hidden;       /* ✅ 保证内容被圆角裁剪 */
     pointer-events: auto;   /* ✅ 让卡片内部按钮可以正常点击 */
@@ -57,7 +59,6 @@ body {
     margin-bottom: 16px;
     padding-bottom: 10px;
     border-bottom: 1px solid var(--border-color);
-    -webkit-app-region: drag;
 }
 
 .logo {
@@ -65,7 +66,6 @@ body {
     align-items: center;
     gap: 6px;
     user-select: none;
-    -webkit-app-region: drag;
 }
 
 .logo-icon {
@@ -87,7 +87,6 @@ body {
     display: flex;
     align-items: center;
     gap: 6px;
-    -webkit-app-region: no-drag;
 }
 
 /* ===== 按钮基础 ===== */
@@ -572,6 +571,14 @@ body.content-fullscreen .exit-fullscreen-btn {
 .ctrl-btn:active {
     transform: scale(0.92);
 }
+/* 文字型控制按钮（如倍速 1x）：字号小一号，保持圆形 */
+.ctrl-btn-text {
+    font-size: 14px;
+    font-weight: 600;
+    min-width: 40px;
+    width: auto;
+    padding: 0 10px;
+}
 .primary-btn {
     width: 50px;
     height: 50px;
@@ -695,9 +702,8 @@ body.content-fullscreen .exit-fullscreen-btn {
     right: -360px;
     width: 340px;
     bottom: 12px;
-    background: rgba(255, 255, 255, 0.95);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    /* 跟随主题：--panel-bg 由 theme.js 按当前色板生成 */
+    background: var(--panel-bg, rgba(255, 255, 255, 0.95));
     border: 1px solid var(--border-color);
     border-radius: 18px;
     padding: 16px 16px 14px;
@@ -710,6 +716,27 @@ body.content-fullscreen .exit-fullscreen-btn {
 }
 .playlist-panel.open {
     right: 10px;
+}
+
+.playlist-search {
+    flex-shrink: 0;
+    width: 100%;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--card-bg, rgba(255, 255, 255, 0.55));
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+}
+.playlist-search:focus {
+    border-color: var(--accent);
+}
+.playlist-search::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
 }
 
 .playlist-header {
