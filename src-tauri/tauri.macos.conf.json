@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "resources": {
+      "binaries/ffmpeg-aarch64-apple-darwin": "ffmpeg",
+      "binaries/ffprobe-aarch64-apple-darwin": "ffprobe"
+    }
+  }
+}

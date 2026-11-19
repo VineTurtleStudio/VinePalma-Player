@@ -1,36 +1,64 @@
-name: Build VinePalma Player (Linux, Win/Mac Native)
+name: Build VinePalma Player
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
 env:
   APP_NAME: VinePalmaPlayer
-  VERSION: 0.2.0
+  FFMPEG_VERSION: 8.1.2
 
 jobs:
 
   # ============================================================
-  # 1. LINUX 构建 —— 原生 ubuntu 运行器（不用 Docker，更稳定）
+  # 0. 质量门禁：fmt / clippy / test
+  # ============================================================
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+        working-directory: src-tauri
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: Tests
+        run: cargo test
+        working-directory: src-tauri
+
+  # ============================================================
+  # 1. LINUX 构建 —— x86_64 原生
+  #    （aarch64 暂移除：需要交叉链接器与对应架构的 webkit2gtk 开发库，
+  #     且预编译 AppImage 工具链在交叉场景不可行；恢复前需补全这两项）
   # ============================================================
   build-linux:
-    name: Linux - ${{ matrix.arch }}
+    name: Linux x86_64
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64]
-        include:
-          - arch: x86_64
-            rust_target: x86_64-unknown-linux-gnu
-          - arch: aarch64
-            rust_target: aarch64-unknown-linux-gnu
+    needs: lint-test
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -39,39 +67,55 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Install cargo-tauri
-        run: cargo install tauri-cli --locked
+      # ffmpeg sidecar：使用 BtbN 预编译静态构建（与源码自建产物职责相同）
+      - name: Fetch ffmpeg sidecar
+        id: sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-sidecar-linux64-${{ env.FFMPEG_VERSION }}
 
-      - name: Install frontend dependencies
-        run: npm install
+      - name: Download ffmpeg (BtbN linux64)
+        if: steps.sidecar.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p src-tauri/binaries
+          curl -fL --retry 3 -o ffmpeg.tar.xz \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg  src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/*
+          rm -rf ffmpeg.tar.xz ffmpeg-master-latest-linux64-gpl
+
+      - name: Install tauri-cli
+        run: npm i -g @tauri-apps/cli@^2
 
       - name: Build Tauri app
-        run: cargo tauri build --target ${{ matrix.rust_target }}
-        env:
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npx tauri build --bundles deb appimage
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: VinePalmaPlayer-Linux-${{ matrix.arch }}
-          path: src-tauri/target/${{ matrix.rust_target }}/release/bundle/
+          name: VinePalmaPlayer-Linux-x86_64
+          path: src-tauri/target/release/bundle/
           if-no-files-found: error
 
   # ============================================================
-  # 2. WINDOWS 构建
+  # 2. WINDOWS 构建（x86_64 MSVC + NSIS）
   # ============================================================
   build-windows:
-    name: Windows (Native)
+    name: Windows x86_64
     runs-on: windows-latest
+    needs: lint-test
     steps:
       - uses: actions/checkout@v4
 
@@ -85,35 +129,50 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install cargo-tauri
-        run: cargo install tauri-cli --locked
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install frontend dependencies
-        run: npm install
+      - name: Fetch ffmpeg sidecar
+        id: sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-sidecar-win64-${{ env.FFMPEG_VERSION }}
+
+      - name: Download ffmpeg (BtbN win64)
+        if: steps.sidecar.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          curl -fL --retry 3 -o ffmpeg.zip \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+          unzip -q ffmpeg.zip
+          cp ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe  src-tauri/binaries/ffmpeg-x86_64-pc-windows-gnu.exe
+          cp ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe src-tauri/binaries/ffprobe-x86_64-pc-windows-gnu.exe
+          rm -rf ffmpeg.zip ffmpeg-master-latest-win64-gpl
+
+      - name: Install tauri-cli
+        run: npm i -g @tauri-apps/cli@^2
 
       - name: Build Tauri app
-        run: cargo tauri build
-        env:
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: VinePalmaPlayer-Windows
-          path: src-tauri/target/release/bundle/
+          name: VinePalmaPlayer-Windows-x86_64
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
           if-no-files-found: error
 
   # ============================================================
-  # 3. MACOS 构建（Intel + Apple Silicon）
+  # 3. MACOS 构建（Apple Silicon）
+  #    （x86_64 暂移除：evermeet.cx 等预编译源不稳定；需要 Intel 版时用
+  #     scripts/build-ffmpeg-macos.sh 在 Intel 机器上自行构建）
   # ============================================================
   build-macos:
-    name: macOS - ${{ matrix.target }}
+    name: macOS aarch64
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    needs: lint-test
     steps:
       - uses: actions/checkout@v4
 
@@ -125,23 +184,67 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
-      - name: Install cargo-tauri
-        run: cargo install tauri-cli --locked
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install frontend dependencies
-        run: npm install
+      # macOS 无稳定的预编译静态 ffmpeg 分发源，直接用项目脚本源码构建
+      # （配置极简，无需 x264/dav1d，几分钟即可完成）
+      - name: Fetch ffmpeg sidecar
+        id: sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-sidecar-macos-aarch64-${{ env.FFMPEG_VERSION }}
+
+      - name: Build ffmpeg sidecar
+        if: steps.sidecar.outputs.cache-hit != 'true'
+        run: bash scripts/build-ffmpeg-macos.sh
+        env:
+          FFMPEG_VERSION: ${{ env.FFMPEG_VERSION }}
+
+      - name: Install tauri-cli
+        run: npm i -g @tauri-apps/cli@^2
 
       - name: Build Tauri app
-        run: cargo tauri build --target ${{ matrix.target }}
-        env:
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npx tauri build --target aarch64-apple-darwin --bundles app,dmg
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: VinePalmaPlayer-macOS-${{ matrix.target }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/
+          name: VinePalmaPlayer-macOS-aarch64
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/
           if-no-files-found: error
+
+  # ============================================================
+  # 4. RELEASE —— 推送 v* 标签时发布安装包
+  # ============================================================
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows, build-macos]
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect installers
+        run: |
+          mkdir -p release
+          find artifacts -name "*.deb"       -exec cp {} release/ \;
+          find artifacts -name "*.AppImage"  -exec cp {} release/ \;
+          find artifacts -name "*-setup.exe" -exec cp {} release/ \;
+          find artifacts -name "*.exe" ! -name "*-setup.exe" -exec cp {} release/ \;
+          find artifacts -name "*.dmg"       -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

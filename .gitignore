@@ -14,8 +14,12 @@
 # FFmpeg sidecars — built locally by scripts/build-ffmpeg-*.sh, never committed
 /src-tauri/binaries/
 
+# Environment / secrets
+.env
+
 # Editor / OS
 .idea/
+.vscode/
 .DS_Store
 *.swp
 

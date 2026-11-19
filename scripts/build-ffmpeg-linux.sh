@@ -5,24 +5,34 @@
 #
 # Optional external libraries are built when the required tooling is present
 # and skipped (with a warning) otherwise:
-#   - x264   -> H.264 encoder, used by the remux re-encode fallback
-#   - dav1d  -> AV1 decoder
-# Set FFMPEG_NO_X264=1 / FFMPEG_NO_DAV1D=1 to skip them explicitly.
+#   - x264   -> H.264 encoder, used by the remux re-encode fallback (GPL)
+#   - dav1d  -> AV1 decoder (BSD-2-Clause，不需要 GPL)
+# Set ENABLE_X264=0 / ENABLE_DAV1D=0 to skip them explicitly
+# （兼容旧的 FFMPEG_NO_X264=1 / FFMPEG_NO_DAV1D=1 写法）。
 set -euo pipefail
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.2}"
-BUILD_DIR="${BUILD_DIR:-/tmp/opencode/ffmpeg-build}"
+BUILD_DIR="${BUILD_DIR:-${TMPDIR:-/tmp}/vinepalma-ffmpeg-build}"
 OUT_DIR="${OUT_DIR:-$(cd "$(dirname "$0")/.." && pwd)/src-tauri/binaries}"
 JOBS="${JOBS:-$(nproc)}"
 # If the tarball is already present (e.g. downloaded from a mirror), skip re-downloading.
 SRC_TARBALL="${SRC_TARBALL:-$BUILD_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz}"
+
+# 统一开关（兼容旧名）
+if [ "${FFMPEG_NO_X264:-0}" = "1" ]; then ENABLE_X264="${ENABLE_X264:-0}"; fi
+ENABLE_X264="${ENABLE_X264:-1}"
+if [ "${FFMPEG_NO_DAV1D:-0}" = "1" ]; then ENABLE_DAV1D="${ENABLE_DAV1D:-0}"; fi
+ENABLE_DAV1D="${ENABLE_DAV1D:-1}"
 
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
 
 if [ ! -d "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION" ]; then
   if [ ! -f "$SRC_TARBALL" ]; then
     echo "[ffmpeg] downloading source ffmpeg-$FFMPEG_VERSION ..."
-    curl -fL -o "$SRC_TARBALL" \
+    # 官方源优先，Debian 源回退
+    curl -fL --retry 2 -o "$SRC_TARBALL" \
+      "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" \
+      || curl -fL --retry 2 -o "$SRC_TARBALL" \
       "https://deb.debian.org/debian/pool/main/f/ffmpeg/ffmpeg_${FFMPEG_VERSION}.orig.tar.xz"
   fi
   tar -C "$BUILD_DIR" -xf "$SRC_TARBALL"
@@ -45,9 +55,9 @@ fetch_git() { # $1=url $2=dir ; tries git clone, falls back to a second URL set 
   return 1
 }
 
-# x264: H.264 encoder (used by remux re-encode fallback).
+# x264: H.264 encoder (used by remux re-encode fallback). GPL — 启用时整体变 GPL。
 X264_PREFIX="$BUILD_DIR/x264-install"
-if [ "${FFMPEG_NO_X264:-0}" != "1" ] && [ ! -f "$X264_PREFIX/lib/libx264.a" ]; then
+if [ "$ENABLE_X264" = "1" ] && [ ! -f "$X264_PREFIX/lib/libx264.a" ]; then
   echo "[ffmpeg] fetching x264 source ..."
   fetch_git "https://code.videolan.org/videolan/x264.git" "$BUILD_DIR/x264" \
     || fetch_git "https://github.com/mirror/x264.git" "$BUILD_DIR/x264" || true
@@ -67,17 +77,19 @@ if [ "${FFMPEG_NO_X264:-0}" != "1" ] && [ ! -f "$X264_PREFIX/lib/libx264.a" ]; t
     echo "[ffmpeg] 警告: 无法获取 x264 源码，重编码回退将使用内置 MPEG-4 编码器"
   fi
 fi
+GPL_NEEDED=0
 if [ -f "$X264_PREFIX/lib/libx264.a" ]; then
   EXTRA_OPTIONS+=(--enable-gpl --enable-libx264)
   EXTRA_CFLAGS+=("-I$X264_PREFIX/include")
   EXTRA_LDFLAGS+=("-L$X264_PREFIX/lib")
   EXTRA_LIBS+=(-lx264)
   HAS_OPTIONAL=1
+  GPL_NEEDED=1
 fi
 
-# dav1d: AV1 decoder.
+# dav1d: AV1 decoder. BSD-2-Clause 许可，不需要 --enable-gpl。
 DAV1D_PREFIX="$BUILD_DIR/dav1d-install"
-if [ "${FFMPEG_NO_DAV1D:-0}" != "1" ] && [ ! -f "$DAV1D_PREFIX/lib/libdav1d.a" ]; then
+if [ "$ENABLE_DAV1D" = "1" ] && [ ! -f "$DAV1D_PREFIX/lib/libdav1d.a" ]; then
   if command -v meson >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
     echo "[ffmpeg] fetching dav1d source ..."
     fetch_git "https://code.videolan.org/videolan/dav1d.git" "$BUILD_DIR/dav1d" \
@@ -101,7 +113,7 @@ if [ "${FFMPEG_NO_DAV1D:-0}" != "1" ] && [ ! -f "$DAV1D_PREFIX/lib/libdav1d.a" ]
   fi
 fi
 if [ -f "$DAV1D_PREFIX/lib/libdav1d.a" ]; then
-  EXTRA_OPTIONS+=(--enable-gpl --enable-libdav1d)
+  EXTRA_OPTIONS+=(--enable-libdav1d)
   EXTRA_CFLAGS+=("-I$DAV1D_PREFIX/include")
   EXTRA_LDFLAGS+=("-L$DAV1D_PREFIX/lib")
   EXTRA_LIBS+=(-ldav1d)
