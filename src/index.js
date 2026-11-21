@@ -104,27 +104,43 @@ document.addEventListener('DOMContentLoaded', () => {
     let resumeIndex = -1;
     let resumeAt = null; // 秒
     let persistTimer = null;
-    function persistPlaylistState() {
-        if (persistTimer) clearTimeout(persistTimer);
+    // immediate=true：跳过节流立即落盘。关键用户操作（导入/删除/清空/移动/切曲）
+    // 必须立即写。非立即路径用节流而非防抖：播放中 timeupdate（约 4 次/秒）会不断
+    // 重置防抖定时器，把写入无限顺延（实测播放期间完全停滞不落盘）；节流保证最多
+    // 每 500ms 写一次，续播位置滞后不超过约 1 秒。
+    function persistPlaylistState(immediate = false) {
+        if (persistTimer) {
+            if (!immediate) return; // 节流：已有排队的写入就不再重排
+            clearTimeout(persistTimer); // 立即写时丢弃排队中的旧状态
+            persistTimer = null;
+        }
+        if (immediate) {
+            writePlaylistState();
+            return;
+        }
         persistTimer = setTimeout(() => {
             persistTimer = null;
-            const media = activeMedia();
-            const position = (media && isFinite(media.currentTime)) ? media.currentTime : 0;
-            const state = {
-                items: playlist.map(item => ({
-                    path: item.path,
-                    name: item.name,
-                    duration: item.duration || 0,
-                    title: item.title,
-                    artist: item.artist,
-                    has_video: !!item.has_video,
-                })),
-                currentIndex,
-                playMode,
-                position,
-            };
-            invoke('store_set', { key: 'playlistState', value: state }).catch(() => {});
+            writePlaylistState();
         }, 500);
+    }
+
+    function writePlaylistState() {
+        const media = activeMedia();
+        const position = (media && isFinite(media.currentTime)) ? media.currentTime : 0;
+        const state = {
+            items: playlist.map(item => ({
+                path: item.path,
+                name: item.name,
+                duration: item.duration || 0,
+                title: item.title,
+                artist: item.artist,
+                has_video: !!item.has_video,
+            })),
+            currentIndex,
+            playMode,
+            position,
+        };
+        invoke('store_set', { key: 'playlistState', value: state }).catch(() => {});
     }
 
     // 曲目切换时的“待自动播放”标记：等 canplay 元数据就绪后再 play，避免
@@ -160,6 +176,42 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ============================================================
+    // 2.1 缓冲进度显示：把 media.buffered 段画进进度条轨道背景
+    //     （inline backgroundImage 叠在 CSS 背景色之上，不碰 value）
+    // ============================================================
+    const BUFFERED_COLOR_MAIN = 'rgba(252, 168, 119, 0.45)'; // 主界面橙
+    const BUFFERED_COLOR_VIDEO = 'rgba(255, 255, 255, 0.5)'; // 视频浮层白
+    function paintBuffered(media, slider, color) {
+        if (!slider) return;
+        const dur = currentDuration();
+        const b = media && media.buffered;
+        let grad = '';
+        if (b && b.length && isFiniteDuration(dur)) {
+            const stops = [];
+            for (let i = 0; i < b.length; i++) {
+                const s = Math.min(Math.max(b.start(i) / dur, 0), 1) * 100;
+                const e = Math.min(Math.max(b.end(i) / dur, 0), 1) * 100;
+                if (e - s < 0.15) continue; // 忽略过窄段，避免渲染毛刺
+                stops.push(`transparent ${s.toFixed(2)}%`, `${color} ${s.toFixed(2)}%`,
+                    `${color} ${e.toFixed(2)}%`, `transparent ${e.toFixed(2)}%`);
+            }
+            if (stops.length) grad = `linear-gradient(to right, ${stops.join(', ')})`;
+        }
+        if (slider.dataset.bufGrad !== grad) {
+            slider.dataset.bufGrad = grad;
+            slider.style.backgroundImage = grad;
+        }
+    }
+
+    // 只画当前活动媒体元素的缓冲（两个媒体元素只有一个是活跃的，
+    // 非活跃元素 buffered 为空，恰好把另一条进度条上的残留清掉）
+    function updateBufferedUI() {
+        const media = activeMedia();
+        paintBuffered(media, progressBar, BUFFERED_COLOR_MAIN);
+        paintBuffered(media, videoProgressBar, BUFFERED_COLOR_VIDEO);
+    }
+
+    // ============================================================
     // 3. 核心函数
     // ============================================================
     function formatTime(seconds) {
@@ -170,6 +222,53 @@ document.addEventListener('DOMContentLoaded', () => {
         const s = seconds % 60;
         if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
         return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    // ============================================================
+    // 3.1 播放列表拖拽排序
+    // ============================================================
+    let dragFromIndex = -1; // 拖拽中的曲目在 playlist 中的原始索引
+
+    function clearDragMarkers() {
+        if (!playlistEl) return;
+        playlistEl.querySelectorAll('.drag-above, .drag-below, .dragging').forEach(el => {
+            el.classList.remove('drag-above', 'drag-below', 'dragging');
+        });
+    }
+
+    // 拖拽时靠近列表上下边缘自动滚动，长列表才能拖到视口外的位置
+    function autoScrollPlaylist(clientY) {
+        if (!playlistEl) return;
+        const rect = playlistEl.getBoundingClientRect();
+        const edge = 32;
+        if (clientY < rect.top + edge) {
+            playlistEl.scrollTop -= 12;
+        } else if (clientY > rect.bottom - edge) {
+            playlistEl.scrollTop += 12;
+        }
+    }
+
+    // 把 playlist[from] 移动到原 targetIdx 条目的上/下方，同步修正
+    // currentIndex / resumeIndex（它们指向的曲目不能因插入移位而变），刷新并持久化。
+    // pos 统一换算成"先移除 from 项之后"的真实插入点，再对旧索引做同样的重映射。
+    function movePlaylistItem(from, targetIdx, below) {
+        if (from === targetIdx && !below) return;      // 拖回自身上半区 = 原地
+        if (from === targetIdx - 1 && below) return;   // 拖到下一项下半区 = 原地
+        let pos = below ? targetIdx + 1 : targetIdx;   // 原数组中的插入位置
+        if (pos > from) pos -= 1;                      // 减去被移除的 from 项
+        const [moved] = playlist.splice(from, 1);
+        playlist.splice(pos, 0, moved);
+        const remap = (i) => {
+            if (i < 0) return i;
+            if (i === from) return pos;
+            if (i < from) return i >= pos ? i + 1 : i;
+            return (i - 1) >= pos ? i : i - 1;
+        };
+        currentIndex = remap(currentIndex);
+        resumeIndex = remap(resumeIndex);
+        updatePlaylistUI();
+        persistPlaylistState(true); // 防抖会被播放中的 timeupdate 饿死，必须立即写
+        setStatus(`↕ 已移动到第 ${pos + 1} 位：${moved.title || moved.name}`, 'info');
     }
 
     function updatePlaylistUI() {
@@ -223,6 +322,47 @@ document.addEventListener('DOMContentLoaded', () => {
                 closePlaylist();
             });
 
+            // 拖拽排序（过滤模式下禁用：可见项与真实索引不连续，插入位置语义不清）
+            if (!playlistFilter) {
+                li.draggable = true;
+                li.addEventListener('dragstart', (e) => {
+                    dragFromIndex = idx;
+                    li.classList.add('dragging');
+                    if (e.dataTransfer) {
+                        e.dataTransfer.effectAllowed = 'move';
+                        try { e.dataTransfer.setData('text/plain', String(idx)); } catch (_) {}
+                    }
+                });
+                li.addEventListener('dragover', (e) => {
+                    if (dragFromIndex === -1) return; // 只接受列表内部拖拽
+                    e.preventDefault();
+                    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+                    const rect = li.getBoundingClientRect();
+                    const below = e.clientY > rect.top + rect.height / 2;
+                    li.classList.toggle('drag-below', below);
+                    li.classList.toggle('drag-above', !below);
+                    autoScrollPlaylist(e.clientY);
+                });
+                li.addEventListener('dragleave', () => {
+                    li.classList.remove('drag-above', 'drag-below');
+                });
+                li.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    const rect = li.getBoundingClientRect();
+                    const below = e.clientY > rect.top + rect.height / 2;
+                    clearDragMarkers();
+                    if (dragFromIndex !== -1 && dragFromIndex !== idx) {
+                        movePlaylistItem(dragFromIndex, idx, below);
+                    }
+                    dragFromIndex = -1;
+                });
+                // 拖拽取消（在列表外松手）也必须清状态，否则残留半透明样式与脏 dragFromIndex
+                li.addEventListener('dragend', () => {
+                    clearDragMarkers();
+                    dragFromIndex = -1;
+                });
+            }
+
             playlistEl.appendChild(li);
         });
     }
@@ -253,7 +393,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         playlist.push(normalizeTrack(metadata));
         updatePlaylistUI();
-        persistPlaylistState();
+        persistPlaylistState(true);
         if (currentIndex === -1) {
             playIndex(playlist.length - 1);
         }
@@ -273,7 +413,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
         updatePlaylistUI();
-        persistPlaylistState();
+        persistPlaylistState(true);
         if (added > 0 && currentIndex === -1) {
             playIndex(0);
         }
@@ -298,7 +438,7 @@ document.addEventListener('DOMContentLoaded', () => {
             currentIndex--;
         }
         updatePlaylistUI();
-        persistPlaylistState();
+        persistPlaylistState(true);
     }
 
     function clearPlaylist() {
@@ -312,7 +452,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateSongInfo(null);
         updatePlayToggleIcon();
         updateCover(null);
-        persistPlaylistState();
+        persistPlaylistState(true);
         setStatus('🗑 列表已清空', 'info');
     }
 
@@ -414,7 +554,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             updatePlaylistUI();
             emitMiniState();
-            persistPlaylistState();
+            persistPlaylistState(true);
             setStatus(`▶ 正在播放: ${item.title}`, 'success');
         } catch (err) {
             console.error('[Renderer] 解码失败:', err);
@@ -465,7 +605,7 @@ document.addEventListener('DOMContentLoaded', () => {
             pendingAutoplay = false;
             isPlaying = false;
             updatePlayToggleIcon();
-            persistPlaylistState();
+            persistPlaylistState(true);
             setStatus('⏸ 已暂停', 'info');
         } else {
             media.play().catch(err => {
@@ -1123,7 +1263,7 @@ document.addEventListener('DOMContentLoaded', () => {
         modeBtn.addEventListener('click', () => {
             playMode = (playMode + 1) % 3;
             updateModeBtn();
-            persistPlaylistState();
+            persistPlaylistState(true);
         });
     }
 
@@ -1413,6 +1553,7 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         media.addEventListener('timeupdate', () => {
+            updateBufferedUI(); // 缓冲段与拖动状态无关，拖动中也继续更新
             if (draggingProgress) return; // 拖动中不更新进度条值
             persistPlaylistState(); // 防抖写入：为"重启续播"记录位置
             const dur = currentDuration();
@@ -1481,11 +1622,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 网络缓冲不足/加载被阻塞时都会触发。
         media.addEventListener('stalled', () => logMediaEvent('stalled'));
-        media.addEventListener('waiting', () => logMediaEvent('waiting'));
+        media.addEventListener('waiting', () => { logMediaEvent('waiting'); updateBufferedUI(); });
         media.addEventListener('seeking', () => logMediaEvent('seeking'));
         //media.addEventListener('seeked', () => logMediaEvent('seeked'));
         //media.addEventListener('durationchange', () => logMediaEvent('durationchange'));
-        media.addEventListener('emptied', () => logMediaEvent('emptied'));
+        media.addEventListener('emptied', () => { logMediaEvent('emptied'); updateBufferedUI(); });
+        // 数据持续流入：progress 是缓冲变化最直接的事件
+        media.addEventListener('progress', updateBufferedUI);
+        media.addEventListener('playing', updateBufferedUI);
 
 
         media.addEventListener('seeked', () => {
@@ -1522,12 +1666,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         media.addEventListener('loadedmetadata', () => {
             logMediaEvent('loadedmetadata');
+            updateBufferedUI(); // 元数据就绪后才有可用的 dur 做缓冲映射
             const dur = media.duration;
             if (isFiniteDuration(dur) && dur > 0) {
                 // 如果 playlist 中 duration 为 0，则更新（避免首次加载无数据）
                 if (currentIndex >= 0 && playlist[currentIndex] && !playlist[currentIndex].duration) {
                     playlist[currentIndex].duration = dur;
                     updatePlaylistUI();
+                    persistPlaylistState(true); // 时长补全也是关键状态，防抖会被播放饿死
                 }
             }
             // 使用 currentDuration() 更新显示
