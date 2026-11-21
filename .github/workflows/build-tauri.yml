@@ -79,7 +79,7 @@ jobs:
       # ffmpeg sidecar：使用 BtbN 预编译静态构建（与源码自建产物职责相同）
       - name: Fetch ffmpeg sidecar
         id: sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-sidecar-linux64-${{ env.FFMPEG_VERSION }}
@@ -134,7 +134,7 @@ jobs:
 
       - name: Fetch ffmpeg sidecar
         id: sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-sidecar-win64-${{ env.FFMPEG_VERSION }}
@@ -193,7 +193,7 @@ jobs:
       # （配置极简，无需 x264/dav1d，几分钟即可完成）
       - name: Fetch ffmpeg sidecar
         id: sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-sidecar-macos-aarch64-${{ env.FFMPEG_VERSION }}
