@@ -321,17 +321,23 @@ pub fn encode_key(path: &Path) -> String {
 }
 
 pub fn decode_key(key: &str) -> Option<PathBuf> {
-    URL_SAFE_NO_PAD.decode(key).ok().and_then(|b| {
-        #[cfg(unix)]
-        {
+    // 按 cfg 拆成两条链：unix 分支闭包恒返回 Some，须用 map（否则 clippy
+    // bind_instead_of_map 在 -D warnings 下报错）；Windows 需 UTF-8 校验，
+    // 闭包返回 Option，须用 and_then。合成一个闭包两个平台必然违一边。
+    #[cfg(unix)]
+    {
+        URL_SAFE_NO_PAD.decode(key).ok().map(|b| {
             use std::os::unix::ffi::OsStringExt;
-            Some(PathBuf::from(std::ffi::OsString::from_vec(b)))
-        }
-        #[cfg(not(unix))]
-        {
-            String::from_utf8(b).ok().map(PathBuf::from)
-        }
-    })
+            PathBuf::from(std::ffi::OsString::from_vec(b))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        URL_SAFE_NO_PAD
+            .decode(key)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok().map(PathBuf::from))
+    }
 }
 
 /// A short (16 hex chars) stable hash of a path, used for cache *file names*.
