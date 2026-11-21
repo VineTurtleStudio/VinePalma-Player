@@ -21,7 +21,7 @@ jobs:
     name: Lint & Test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 质量门禁只做编译，tauri-build 编译期会校验 sidecar 文件存在（从不执行），
       # 用占位文件替代真实 ffmpeg；真实 sidecar 仅在平台构建 job 中获取。
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: lint-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -126,7 +126,7 @@ jobs:
     runs-on: windows-latest
     needs: lint-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -183,7 +183,7 @@ jobs:
     runs-on: macos-latest
     needs: lint-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
