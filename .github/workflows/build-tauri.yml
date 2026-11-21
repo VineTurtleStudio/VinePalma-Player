@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 质量门禁只做编译，tauri-build 编译期会校验 sidecar 文件存在（从不执行），
+      # 用占位文件替代真实 ffmpeg；真实 sidecar 仅在平台构建 job 中获取。
+      # 若缺此步骤，build.rs 报 `resource path binaries/ffmpeg-... doesn't exist`。
+      - name: Placeholder ffmpeg sidecar
+        run: |
+          mkdir -p src-tauri/binaries
+          touch src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          touch src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
